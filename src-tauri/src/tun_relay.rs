@@ -143,6 +143,7 @@ impl RelayHandle {
 pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Result<RelayHandle> {
     let gateway = default_gateway().map_err(|e| anyhow!("no default gateway found: {e}"))?;
 
+    let tun_gw = crate::tun::TUN_IPV4.to_string();
     let mut routes_added: Vec<(String, String)> = Vec::new();
     let install = |routes_added: &mut Vec<(String, String)>| -> Result<()> {
         for prefix in ENGINE_PREFIXES_V4 {
@@ -151,7 +152,6 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
             route_add_idempotent(dest, &mask, &gateway.to_string())?;
             routes_added.push((dest.to_string(), mask));
         }
-        let tun_gw = crate::tun::TUN_IPV4.to_string();
         for dest in ["0.0.0.0", "128.0.0.0"] {
             route_add_idempotent(dest, "128.0.0.0", &tun_gw)?;
             routes_added.push((dest.to_string(), "128.0.0.0".to_string()));
