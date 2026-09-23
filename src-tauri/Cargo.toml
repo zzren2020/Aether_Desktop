@@ -20,6 +20,21 @@ anyhow = "1"
 parking_lot = "0.12"
 # Wintun — معادل ویندوزیِ VpnService + hev-tun در اندروید
 wintun = "0.5"
+# >>> AETHER-APP-FIX tun-relay-goes-live
+# رلهٔ فضای‌کاربرِ TUN→SOCKS5 — همان چیزی که کامنتِ بالا («اگر روزی رلهٔ
+# فضای‌کاربرِ TUN→SOCKS5 نوشته شود، همان‌جا برمی‌گردند») پیش‌بینی کرده بود.
+#   * smoltcp — پشتهٔ TCP/IP فضای‌کاربر: بسته‌های خامِ Wintun را می‌گیرد و
+#     جریانِ TCP و دیتاگرامِ UDP واقعی تحویل می‌دهد (معادل hev-socks5-tunnel
+#     در اندروید که tun2socks را می‌سازد).
+#   * tokio — زمان‌اجرای async برای دمیدنِ مسیرِ رله (کپیِ دوسویهٔ SOCKS5،
+#     انجمنِ UDP، چرخهٔ poll). tauri خودش روی tokio می‌نشیند.
+smoltcp = { version = "0.12", default-features = false, features = [
+  "std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp",
+] }
+tokio = { version = "1", features = [
+  "rt", "net", "io-util", "time", "sync",
+] }
+# <<< AETHER-APP-FIX tun-relay-goes-live
 # ۱.۲.۵-perf — `ipstack` و `tokio` از این‌جا برداشته شدند.
 #
 # هیچ‌یک در `src-tauri/src/` استفاده نمی‌شد: تنها اشارهٔ `ipstack` یک کامنت در
