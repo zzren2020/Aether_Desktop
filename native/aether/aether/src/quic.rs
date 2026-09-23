@@ -571,10 +571,11 @@ pub async fn run(
                 log_or_debug(
                     quiet,
                     format!(
-                        "peer closed: code=0x{:x} app={} reason={}",
+                        "peer closed: code=0x{:x} app={} reason={}{}",
                         e.error_code,
                         e.is_app,
-                        String::from_utf8_lossy(&e.reason)
+                        String::from_utf8_lossy(&e.reason),
+                        describe_close_code(e.error_code, e.is_app)
                     ),
                 );
             }
@@ -582,10 +583,11 @@ pub async fn run(
                 log_or_debug(
                     quiet,
                     format!(
-                        "local closed: code=0x{:x} app={} reason={}",
+                        "local closed: code=0x{:x} app={} reason={}{}",
                         e.error_code,
                         e.is_app,
-                        String::from_utf8_lossy(&e.reason)
+                        String::from_utf8_lossy(&e.reason),
+                        describe_close_code(e.error_code, e.is_app)
                     ),
                 );
             }
@@ -608,6 +610,118 @@ fn log_or_debug(quiet: bool, msg: String) {
         log::info!("{msg}");
     }
 }
+
+// >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+/// Spells a QUIC close code out in terms a bug report can act on.
+///
+/// ## Why the raw hex was not enough
+///
+/// QUIC reserves `0x0100-0x01ff` for `CRYPTO_ERROR`, and the low byte is the TLS
+/// alert that caused the close. A MASQUE edge that will not serve the requested
+/// hostname refuses exactly that way. The 2026-09-22 log recorded four of them
+/// against the inner hop of MASQUE-in-MASQUE and said only:
+///
+/// ```text
+///   peer closed: code=0x128 app=false reason=
+/// ```
+///
+/// `0x128` is `0x100 + 40`, and 40 is TLS `handshake_failure` - which is a
+/// statement about that address, not about MASQUE-over-WARP. Decoding it at the
+/// source means the next log says so by itself.
+///
+/// Returns a suffix to append after the raw code, or an empty string for a code
+/// that is already self-explanatory.
+fn describe_close_code(code: u64, is_app: bool) -> String {
+    if is_app {
+        return format!(" [application code 0x{code:x}]");
+    }
+    if (0x0100..=0x01ff).contains(&code) {
+        let alert = (code & 0xff) as u8;
+        return format!(
+            " [CRYPTO_ERROR: TLS alert {alert} ({})]",
+            tls_alert_name(alert)
+        );
+    }
+    let name = match code {
+        0x00 => "NO_ERROR",
+        0x01 => "INTERNAL_ERROR",
+        0x02 => "CONNECTION_REFUSED",
+        0x03 => "FLOW_CONTROL_ERROR",
+        0x04 => "STREAM_LIMIT_ERROR",
+        0x05 => "STREAM_STATE_ERROR",
+        0x06 => "FINAL_SIZE_ERROR",
+        0x07 => "FRAME_ENCODING_ERROR",
+        0x08 => "TRANSPORT_PARAMETER_ERROR",
+        0x09 => "CONNECTION_ID_LIMIT_ERROR",
+        0x0a => "PROTOCOL_VIOLATION",
+        0x0b => "INVALID_TOKEN",
+        0x0c => "APPLICATION_ERROR",
+        0x0d => "CRYPTO_BUFFER_EXCEEDED",
+        0x0e => "KEY_UPDATE_ERROR",
+        0x0f => "AEAD_LIMIT_REACHED",
+        0x10 => "NO_VIABLE_PATH",
+        _ => return String::new(),
+    };
+    format!(" [{name}]")
+}
+
+/// The TLS 1.3 alert names an alert number can carry.
+fn tls_alert_name(alert: u8) -> &'static str {
+    match alert {
+        0 => "close_notify",
+        10 => "unexpected_message",
+        20 => "bad_record_mac",
+        22 => "record_overflow",
+        40 => "handshake_failure",
+        42 => "bad_certificate",
+        43 => "unsupported_certificate",
+        44 => "certificate_revoked",
+        45 => "certificate_expired",
+        46 => "certificate_unknown",
+        47 => "illegal_parameter",
+        48 => "unknown_ca",
+        49 => "access_denied",
+        50 => "decode_error",
+        51 => "decrypt_error",
+        70 => "protocol_version",
+        71 => "insufficient_security",
+        80 => "internal_error",
+        86 => "inappropriate_fallback",
+        90 => "user_canceled",
+        109 => "missing_extension",
+        110 => "unsupported_extension",
+        112 => "unrecognized_name",
+        113 => "bad_certificate_status_response",
+        116 => "certificate_required",
+        120 => "no_application_protocol",
+        _ => "unrecognised alert",
+    }
+}
+
+/// Pulls the TLS alert out of a QUIC close code if the text carries one.
+///
+/// Used by the caller that only sees a formatted error string rather than a
+/// `quiche::ConnectionError`.
+pub fn tls_alert_in(message: &str) -> Option<u8> {
+    let mut rest = message;
+    while let Some(at) = rest.find("0x") {
+        let hex: String = rest[at + 2..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect();
+        rest = &rest[at + 2 + hex.len()..];
+        if hex.is_empty() {
+            continue;
+        }
+        if let Ok(value) = u64::from_str_radix(&hex, 16) {
+            if (0x0100..=0x01ff).contains(&value) {
+                return Some((value & 0xff) as u8);
+            }
+        }
+    }
+    None
+}
+// <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
 
 fn poll_h3(
     conn: &mut quiche::Connection,
@@ -1082,3 +1196,45 @@ mod v2_bait_tests {
         responder.await.unwrap();
     }
 }
+
+// >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+/// Close-code decoding has nothing to do with the v2 bait, so it gets a module
+/// of its own instead of being appended to `v2_bait_tests`.
+#[cfg(test)]
+mod close_code_tests {
+    use super::*;
+
+    /// The exact code from the 2026-09-22 MASQUE-in-MASQUE log, which four
+    /// different inner edges all returned.
+    #[test]
+    fn the_masque_inner_edge_refusal_is_named_as_a_tls_handshake_failure() {
+        let described = describe_close_code(0x128, false);
+        assert!(
+            described.contains("handshake_failure"),
+            "0x128 is CRYPTO_ERROR carrying TLS alert 40, got: {described}"
+        );
+        assert!(described.contains("CRYPTO_ERROR"));
+    }
+
+    #[test]
+    fn transport_codes_are_named_and_unknown_ones_stay_quiet() {
+        assert!(describe_close_code(0x00, false).contains("NO_ERROR"));
+        assert!(describe_close_code(0x0a, false).contains("PROTOCOL_VIOLATION"));
+        assert!(describe_close_code(0x10, false).contains("NO_VIABLE_PATH"));
+        assert!(describe_close_code(0x00, true).contains("application"));
+        assert_eq!(describe_close_code(0xdead_beef, false), "");
+    }
+
+    #[test]
+    fn the_alert_is_recovered_from_a_formatted_error() {
+        assert_eq!(tls_alert_in("peer closed: code=0x128 app=false reason="), Some(40));
+        assert_eq!(
+            tls_alert_in("[inner] tunnel exited before validation (code=0x14a)"),
+            Some(74)
+        );
+        // A plain transport code is not an alert, and a bare number is not a code.
+        assert_eq!(tls_alert_in("code=0x0a"), None);
+        assert_eq!(tls_alert_in("tunnel failed validation"), None);
+    }
+}
+// <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge

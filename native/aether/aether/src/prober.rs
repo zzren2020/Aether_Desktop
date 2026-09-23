@@ -54,6 +54,61 @@ pub const MASQUE_ZT_CIDRS_V4: &[&str] = &["162.159.197.0/24"];
 
 pub const MASQUE_ZT_CIDRS_V6: &[&str] = &["2606:4700:102::/48"];
 
+// >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+/// Gateways this process has *seen answer a real MASQUE handshake*, newest
+/// first, shared by every scan in the process.
+///
+/// ## Why the scan has to hand its findings on
+///
+/// The inner hop of MASQUE-in-MASQUE is chosen by [`crate::inner_masque_candidates`],
+/// which used to pick six hosts at random inside the outer hop's `/24`. A random
+/// address in `162.159.198.0/24` is not a MASQUE edge; it is just an address in
+/// the same block. The 2026-09-22 log spent four full TLS handshakes learning
+/// that - every one of them came back as a QUIC `CRYPTO_ERROR` carrying TLS
+/// alert 40 (`handshake_failure`):
+///
+/// ```text
+///   [-] inner edge 162.159.198.153:443 does not serve masque from inside the tunnel
+///   [-] inner edge 162.159.198.235:443 does not serve masque from inside the tunnel
+///   [-] inner edge 162.159.198.216:443 does not serve masque from inside the tunnel
+///   [-] inner edge 162.159.198.46:443  does not serve masque from inside the tunnel
+/// ```
+///
+/// Meanwhile the outer scan had already proven `162.159.198.2:443` works. The
+/// addresses a scan proves are the best possible input for the inner hop, so the
+/// scan records them here and the inner hop reads them back.
+///
+/// Bounded so a long-lived process cannot grow it without limit.
+static PROVEN_GATEWAYS: OnceLock<Mutex<Vec<SocketAddr>>> = OnceLock::new();
+
+const PROVEN_GATEWAYS_MAX: usize = 32;
+
+fn proven_cell() -> &'static Mutex<Vec<SocketAddr>> {
+    PROVEN_GATEWAYS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Records a gateway that just completed a deep MASQUE verification.
+pub fn remember_gateway(addr: SocketAddr) {
+    let mut list = match proven_cell().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Move to the front rather than duplicating: the most recent proof is the
+    // one most likely to still hold.
+    list.retain(|existing| *existing != addr);
+    list.insert(0, addr);
+    list.truncate(PROVEN_GATEWAYS_MAX);
+}
+
+/// Gateways proven this session, best-known first.
+pub fn proven_gateways() -> Vec<SocketAddr> {
+    match proven_cell().lock() {
+        Ok(g) => g.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+// <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+
 pub fn zero_trust_mode() -> bool {
     std::env::var("AETHER_TEAM")
         .map(|value| !value.trim().is_empty())
@@ -475,6 +530,63 @@ fn early_abort_enabled() -> bool {
     std::env::var("AETHER_SCAN_NO_EARLY_ABORT").is_err()
 }
 
+/// >>> AETHER-APP-FIX settle-after-the-first-good-gateway
+/// How long the scan keeps looking *after* the first gateway has answered.
+///
+/// ## The bug this closes
+///
+/// The settle window used to be armed only once the scan already held
+/// `target_successes` gateways - six of them in `balanced`. On a network where
+/// one edge answers and the remaining two thousand are filtered, that condition
+/// is **never** reached, so the window was never armed and the loop ran to the
+/// very last millisecond of its budget. Two field logs of 2026-09-22 show the
+/// cost:
+///
+/// ```text
+///   log 1 (aether-psiphon, masque)   05:43:46.898 scan starts, budget=61s
+///                                    05:43:49.408 [+] candidate ok 162.159.198.2:443
+///                                    05:44:47.909 [-] scan deadline reached   <- 58s later
+///   log 3 (aether, masque*2)         05:48:30.866 scan starts, budget=61s
+///                                    05:48:33.580 [+] candidate ok 162.159.198.2:443
+///                                    05:49:31.873 [-] scan deadline reached   <- 58s later
+/// ```
+///
+/// In log 3 the launcher then killed the attempt at its 75 s window while the
+/// inner hop was still being tried, twice in a row, and the user was told the
+/// protocol "could not establish a working tunnel on this network". Nothing was
+/// wrong with the network: the gateway had answered 2.7 s into the scan and the
+/// engine spent the next 58 s confirming that the other 2010 candidates were
+/// still filtered.
+///
+/// A gateway in hand is worth more than a sixth gateway. The window is now armed
+/// by the **first** success and never extended, so the scan is bounded by
+/// `first answer + settle` instead of by the whole budget - which is what the
+/// name `quiet_after_first` always said it did.
+///
+/// Modes that declare no target (`thorough`, the full-subnet sweep) keep their
+/// old "scan everything" behaviour on purpose: that mode exists to find the
+/// best edge, not the first usable one.
+///
+/// `AETHER_SCAN_SETTLE_MS=<ms>` overrides the window, and
+/// `AETHER_SCAN_FULL_BUDGET=1` restores the old always-spend-it-all behaviour.
+///
+/// Shared with [`crate::wg_prober`], which had the identical defect: its
+/// `target_successes` for `balanced` is five, so on a network where two or three
+/// endpoints answer, its settle window was never armed either and the scan ran
+/// to the last millisecond of the same budget. One helper, one behaviour, so the
+/// two probers cannot drift apart again.
+pub(crate) fn settle_window(mode_default: Duration) -> Duration {
+    if std::env::var("AETHER_SCAN_FULL_BUDGET").is_ok() {
+        return Duration::ZERO;
+    }
+    std::env::var("AETHER_SCAN_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(mode_default)
+}
+// <<< AETHER-APP-FIX settle-after-the-first-good-gateway
+
 const IRONCLAD_TCPING_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Strategy {
@@ -599,6 +711,12 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                     }
                     Some(Some(pr)) => {
                         log::info!("[+] candidate ok {}:{} rtt={:?}", pr.ip, pr.port, pr.rtt);
+                        // >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+                        // Hand the finding on: the inner hop of MASQUE-in-MASQUE
+                        // has nothing better to aim at than an address this scan
+                        // just watched complete a MASQUE handshake.
+                        remember_gateway(SocketAddr::new(pr.ip, pr.port));
+                        // <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
                         if st.early_exit_first {
                             return Ok(pr);
                         }
@@ -608,14 +726,35 @@ pub async fn hunt_best_gateway(probe: &MasqueProbe, mode: ScanMode) -> Result<Pr
                         });
                         found += 1;
 
-                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
-                            log::info!("[+] reached target of {} gateways, selecting best", st.target_successes);
-                            if !st.quiet_after_first.is_zero() {
-                                quiet_until = Some(Instant::now() + st.quiet_after_first);
-                            } else {
+                        // >>> AETHER-APP-FIX settle-after-the-first-good-gateway
+                        // The window is armed by the FIRST success, not by the
+                        // sixth. See [`settle_window`] for the field logs this
+                        // closes. It is deliberately never extended: a scan that
+                        // re-arms on every new hit is the unbounded scan again.
+                        if st.target_successes > 0 && quiet_until.is_none() {
+                            let settle = settle_window(st.quiet_after_first);
+                            if !settle.is_zero() {
+                                if found >= st.target_successes {
+                                    log::info!(
+                                        "[+] reached target of {} gateways, selecting best",
+                                        st.target_successes
+                                    );
+                                } else {
+                                    log::info!(
+                                        "[+] first working gateway in hand ({} of {} wanted); \
+                                         giving the scan {:?} more to try to beat it, then \
+                                         selecting - a gateway in hand beats a longer scan",
+                                        found,
+                                        st.target_successes,
+                                        settle
+                                    );
+                                }
+                                quiet_until = Some(Instant::now() + settle);
+                            } else if found >= st.target_successes {
                                 break;
                             }
                         }
+                        // <<< AETHER-APP-FIX settle-after-the-first-good-gateway
                     }
                 }
             }

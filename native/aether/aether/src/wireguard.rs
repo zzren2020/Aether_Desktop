@@ -163,6 +163,17 @@ pub struct WgTunnel {
     pub aethernoize: Arc<AetherNoizeConfig>,
     pub client_id: [u8; 3],
     pub local_ipv4: Ipv4Addr,
+    /// >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+    /// How long this tunnel may go without a decodable packet from its peer
+    /// before the health watchdog calls it dead.
+    ///
+    /// This used to be a single process-wide value read from the environment,
+    /// which is wrong for a nested pipeline: the *outer* hop of WARP-in-WARP or
+    /// MASQUE-in-MASQUE is a carrier. It exists to move the inner hop's packets
+    /// and nothing else, so while the inner tunnel is idle the outer is
+    /// legitimately silent - and silence is not death. See
+    /// [`carrier_stale_timeout`].
+    stale_timeout: Duration,
 }
 
 pub struct EstablishedSession {
@@ -200,6 +211,12 @@ impl WgTunnel {
             aethernoize: cfg.aethernoize.clone(),
             client_id: cfg.client_id,
             local_ipv4: cfg.local_ipv4,
+            // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+            // This constructor has no callers today; the live tunnels are built
+            // from an established session. It keeps the data-path budget so that
+            // it can never become a way to bypass the carrier rule by accident.
+            stale_timeout: wg_stale_timeout(),
+            // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
         })
     }
 
@@ -208,6 +225,26 @@ impl WgTunnel {
         aethernoize: Arc<AetherNoizeConfig>,
         inbound_tx: mpsc::Sender<Vec<u8>>,
         local_ipv4: Ipv4Addr,
+    ) -> Self {
+        Self::from_established_with_stale(
+            session,
+            aethernoize,
+            inbound_tx,
+            local_ipv4,
+            wg_stale_timeout(),
+        )
+    }
+
+    /// >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+    /// Same, but with an explicit silence budget. The outer hop of a nested
+    /// pipeline passes [`carrier_stale_timeout`] here so that a carrier
+    /// waiting on an idle inner tunnel is not mistaken for a dead one.
+    pub fn from_established_with_stale(
+        session: EstablishedSession,
+        aethernoize: Arc<AetherNoizeConfig>,
+        inbound_tx: mpsc::Sender<Vec<u8>>,
+        local_ipv4: Ipv4Addr,
+        stale_timeout: Duration,
     ) -> Self {
         Self {
             tunn: session.tunn,
@@ -219,8 +256,10 @@ impl WgTunnel {
             aethernoize,
             client_id: session.client_id,
             local_ipv4,
+            stale_timeout,
         }
     }
+    // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
 
     pub async fn run(self, mut outbound_rx: mpsc::Receiver<Vec<u8>>) -> Result<()> {
         let sock_r = self.sock.clone();
@@ -243,6 +282,18 @@ impl WgTunnel {
         let last_valid_rx: Arc<StdMutex<Instant>> = Arc::new(StdMutex::new(Instant::now()));
         let last_valid_rx_r = last_valid_rx.clone();
         let last_valid_rx_h = last_valid_rx.clone();
+
+        // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+        // Silence is only evidence of death if we actually asked and got nothing
+        // back. A tunnel that has just come up has not been asked anything yet,
+        // so the health task counts the probes it really put on the wire and the
+        // reader clears the count on every decodable packet. Death now needs
+        // *both* a silent peer and [`WG_STALE_MIN_PROBES`] unanswered questions.
+        let stale_timeout = self.stale_timeout;
+        let probes_unanswered: Arc<StdMutex<u32>> = Arc::new(StdMutex::new(0));
+        let probes_unanswered_r = probes_unanswered.clone();
+        let probes_unanswered_h = probes_unanswered.clone();
+        // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
 
         let recv_task = tokio::spawn(async move {
             let mut buf = vec![0u8; MAX_PACKET];
@@ -307,6 +358,10 @@ impl WgTunnel {
 
                         if progressed {
                             *last_valid_rx_r.lock() = Instant::now();
+                            // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+                            // The peer answered: the outstanding questions are moot.
+                            *probes_unanswered_r.lock() = 0;
+                            // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
                         }
 
                         for pkt in to_network.drain(..) {
@@ -525,24 +580,48 @@ impl WgTunnel {
                 tokio::time::sleep(health_check_pause()).await;
 
                 let idle = last_valid_rx_h.lock().elapsed();
-                if idle >= stale_timeout {
+                let asked = *probes_unanswered_h.lock();
+                // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+                // Both conditions, not just the first: a silent peer is only dead
+                // once we have asked it enough times to be sure it is not simply
+                // idle. Without the second half, a carrier hop whose inner tunnel
+                // had nothing to say was killed 10 s after coming up - the
+                // WARP-in-WARP failure in the 2026-09-22 log.
+                if idle >= stale_timeout && asked >= WG_STALE_MIN_PROBES {
                     log::warn!(
-                        "[wg] no valid data from peer {} in {:?}; tunnel considered dead",
+                        "[wg] no valid data from peer {} in {:?} despite {} unanswered data-plane \
+                         probe(s); tunnel considered dead",
                         peer,
-                        idle
+                        idle,
+                        asked
                     );
                     return Err::<(), AetherError>(AetherError::Other(
                         "wireguard tunnel stale: no valid data from peer".into(),
                     ));
                 }
+                if idle >= stale_timeout {
+                    log::debug!(
+                        "[wg] peer {} has been silent for {:?} but only {} probe(s) are \
+                         outstanding; waiting for the probe budget before judging",
+                        peer,
+                        idle,
+                        asked
+                    );
+                }
+                // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
 
                 let probe = build_dataplane_probe(local_ipv4);
                 let mut tunn = tunn_h.lock().await;
-                if let Err(e) =
-                    send_dataplane_probe(&sock_h, &mut tunn, &client_id_h, &probe, &mut out_buf)
-                        .await
+                match send_dataplane_probe(&sock_h, &mut tunn, &client_id_h, &probe, &mut out_buf)
+                    .await
                 {
-                    log::trace!("[wg] health probe send failed: {e}");
+                    // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+                    Ok(()) => {
+                        let mut n = probes_unanswered_h.lock();
+                        *n = n.saturating_add(1);
+                    }
+                    Err(e) => log::trace!("[wg] health probe send failed: {e}"),
+                    // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
                 }
             }
         });
@@ -589,7 +668,12 @@ fn health_check_pause() -> Duration {
     WG_HEALTHCHECK_INTERVAL - WG_HEALTHCHECK_JITTER + Duration::from_millis(offset)
 }
 
-fn wg_stale_timeout() -> Duration {
+/// The silence budget for a data-path hop: the one the user's traffic crosses.
+///
+/// Public so the nested pipelines in `lib.rs` can hand the carrier hop a
+/// different, larger budget while keeping this one for the inner hop. See
+/// [`carrier_stale_timeout`].
+pub fn wg_stale_timeout() -> Duration {
     let secs = std::env::var("AETHER_WG_STALE_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -598,6 +682,80 @@ fn wg_stale_timeout() -> Duration {
         .unwrap_or(10);
     Duration::from_secs(secs)
 }
+
+// >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+/// How many data-plane probes must go unanswered before silence is read as
+/// death rather than as idleness.
+///
+/// The health task asks once every ~3 s, so three outstanding questions is
+/// roughly the same wall-clock budget the old code had - but it is now a
+/// statement about *answers*, not about *silence*.
+const WG_STALE_MIN_PROBES: u32 = 3;
+
+/// The silence budget for the **outer** hop of a nested pipeline.
+///
+/// ## Why the outer hop gets its own number
+///
+/// In WARP-in-WARP and MASQUE-in-MASQUE the outer hop is a carrier: it moves
+/// the inner hop's packets and nothing else. Between the moment the inner
+/// tunnel finishes validating and the moment an application actually pushes
+/// traffic through SOCKS5, the carrier has nothing to carry - and on a
+/// consumer WARP edge, a WireGuard keepalive is an empty data packet that the
+/// peer does not answer. So "no decodable packet from the peer" is the normal
+/// state of a healthy carrier, not a fault.
+///
+/// The 2026-09-22 WARP-in-WARP log shows exactly that:
+///
+/// ```text
+///   05:47:28.974 [+] [outer] wireguard tunnel validated (end-to-end data confirmed)
+///   05:47:30.842 [+] [inner] wireguard tunnel validated (end-to-end data confirmed)
+///   05:47:41.456 [-] [wg] no valid data from peer 188.114.97.32:934 in 10.6141368s;
+///                    tunnel considered dead
+/// ```
+///
+/// Ten seconds of idleness killed a pipeline that had been proven working two
+/// seconds earlier, and the launcher's remaining window was then spent on a
+/// fresh scan it could not finish.
+///
+/// The carrier is still checked - it is not exempt from failure - but it is
+/// judged on a budget sized for a link that is *allowed* to be quiet, and the
+/// inner hop (the one the user's traffic actually crosses) remains the
+/// authority that fails fast. A carrier that is genuinely dead takes the inner
+/// hop down with it within the inner hop's own budget.
+pub fn carrier_stale_timeout() -> Duration {
+    let secs = std::env::var("AETHER_WG_CARRIER_STALE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(86_400))
+        .unwrap_or(45);
+    Duration::from_secs(secs)
+}
+
+/// Clamps a hop's keepalive so it can never be longer than half its own silence
+/// budget.
+///
+/// ## The invariant
+///
+/// A keepalive is the only thing a quiet tunnel sends on its own, so a hop whose
+/// keepalive is longer than the time it is given before being declared dead is
+/// guaranteed to be declared dead while its keepalive is still pending. The
+/// WARP-in-WARP path shipped exactly that: `run_warp_in_warp` handed the inner
+/// hop `keepalive = 20 s` while the watchdog's budget was `10 s`, so the inner
+/// hop could be pronounced stale before it had ever had the chance to speak.
+///
+/// Rather than trust every call site to remember, the clamp is applied where the
+/// value is used, and [`keepalive_is_below_the_stale_budget`] pins it in a test.
+pub fn clamp_keepalive_to_stale(keepalive: u16, stale: Duration) -> u16 {
+    let ceiling = (stale.as_secs() / 2).max(1).min(u16::MAX as u64) as u16;
+    keepalive.min(ceiling).max(1)
+}
+
+#[cfg(test)]
+fn keepalive_is_below_the_stale_budget(keepalive: u16, stale: Duration) -> bool {
+    u64::from(clamp_keepalive_to_stale(keepalive, stale)) < stale.as_secs().max(1)
+}
+// <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
 
 fn build_dns_query() -> Vec<u8> {
     let id: u16 = rand::random();
@@ -1132,6 +1290,59 @@ mod tests {
             "the probe must not repeat byte for byte"
         );
     }
+
+    // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+    /// The invariant that the WARP-in-WARP path shipped broken: a hop's
+    /// keepalive must never outlive the budget it is given before the watchdog
+    /// calls it dead. `run_warp_in_warp` used to pass `20 s` against a `10 s`
+    /// budget, so the inner hop could be pronounced stale before its keepalive
+    /// was ever due.
+    #[test]
+    fn a_keepalive_can_never_outlive_the_stale_budget() {
+        for stale_secs in [1u64, 2, 5, 10, 30, 45, 120, 3600] {
+            let stale = Duration::from_secs(stale_secs);
+            for keepalive in [1u16, 5, 20, 25, 60, u16::MAX] {
+                assert!(
+                    keepalive_is_below_the_stale_budget(keepalive, stale),
+                    "keepalive {keepalive}s survived a {stale_secs}s stale budget"
+                );
+            }
+        }
+    }
+
+    /// The concrete numbers from the 2026-09-22 WARP-in-WARP log: the inner hop
+    /// asked for 20 s, the watchdog allowed 10 s.
+    #[test]
+    fn the_warp_in_warp_inner_keepalive_is_clamped_below_ten_seconds() {
+        let stale = Duration::from_secs(10);
+        assert_eq!(clamp_keepalive_to_stale(20, stale), 5);
+        assert!(keepalive_is_below_the_stale_budget(20, stale));
+    }
+
+    /// A carrier is allowed to be quiet for longer than a data-path hop, and the
+    /// default must stay comfortably above the inner hop's - otherwise the
+    /// nested pipeline is killed by the hop that carries nothing.
+    #[test]
+    fn the_carrier_is_given_more_silence_than_the_data_path() {
+        assert!(carrier_stale_timeout() > wg_stale_timeout());
+        assert!(keepalive_is_below_the_stale_budget(5, carrier_stale_timeout()));
+    }
+
+    /// Silence alone is not death: the watchdog must also have asked and been
+    /// ignored. Three probes at the ~3 s health interval is the same wall-clock
+    /// window the old code had, but as a statement about answers.
+    #[test]
+    fn a_fresh_tunnel_is_not_dead_on_its_first_silent_check() {
+        assert!(WG_STALE_MIN_PROBES >= 2);
+        let probe_gap = WG_HEALTHCHECK_INTERVAL - WG_HEALTHCHECK_JITTER;
+        let to_accumulate = probe_gap * WG_STALE_MIN_PROBES;
+        assert!(
+            to_accumulate <= Duration::from_secs(15),
+            "accumulating the probe budget took {to_accumulate:?}, which would delay a real \
+             failure past the launcher's window"
+        );
+    }
+    // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
 
     #[test]
     fn a_broken_socket_is_still_fatal() {

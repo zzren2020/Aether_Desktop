@@ -264,7 +264,11 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
                 secondary.device_id,
                 secondary.ipv4
             );
-            run_gool(primary, secondary, listen).await
+            // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+            // Its own cache file, not `lastconn_path`: see `gool_lastconn_path`.
+            let lastconn_path = gool_lastconn_path(&primary_path);
+            // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+            run_gool(primary, secondary, listen, lastconn_path).await
         }
         Protocol::MasqueInMasque => {
             select_masque_transport().await;
@@ -280,7 +284,11 @@ pub async fn run_with(args: Vec<String>) -> Result<()> {
                 secondary.ipv4
             );
             let ech = resolve_ech().await;
-            run_mim(primary, secondary, ech, listen).await
+            // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+            // Its own cache file, not `lastconn_path`: see `mim_lastconn_path`.
+            let lastconn_path = mim_lastconn_path(&primary_path);
+            // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+            run_mim(primary, secondary, ech, listen, lastconn_path).await
         }
     }
 }
@@ -298,17 +306,47 @@ struct WiwEndpoints {
     inner: Option<SocketAddr>,
 }
 
+// >>> AETHER-APP-FIX one-edge-can-carry-both-hops
+/// Whether one edge may carry both hops of a nested tunnel.
+///
+/// The answer differs by carrier, and the difference is not cosmetic:
+///
+/// * **WireGuard (warp-in-warp)** — two tunnels are told apart by their public
+///   keys, so one edge carrying both is ordinary usage. Refusing it buys
+///   nothing and costs a great deal: where only one edge is reachable, refusing
+///   it throws away the tunnel that *could* have been built, and `run_gool`
+///   answers by rescanning until the budget is gone.
+/// * **MASQUE (masque-in-masque)** — the edge validates the client certificate,
+///   so the same edge may not accept a second identity. A different edge stays
+///   mandatory here.
+///
+/// The old rule was one sentence for both carriers: *"sending the inner tunnel
+/// back out of the address it already arrived on gains nothing"*. That sentence
+/// is true and the conclusion drawn from it was still wrong — *gains nothing*
+/// is not *must be refused*. Where one edge is all the network offers, reusing
+/// it is the only path that arrives, and that is a gain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedEdge {
+    /// The hops must leave through different edges (MASQUE).
+    Refused,
+    /// One edge may carry both hops (WireGuard).
+    Allowed,
+}
+// <<< AETHER-APP-FIX one-edge-can-carry-both-hops
+
 impl WiwEndpoints {
     fn is_empty(&self) -> bool {
         self.outer.is_none() && self.inner.is_none()
     }
 
-    /// The hops have to leave through different edges: sending the inner tunnel
-    /// back out of the address it already arrived on gains nothing, and
-    /// `run_warp_in_warp` refuses it.
-    fn checked(self) -> Result<Self> {
+    // >>> AETHER-APP-FIX one-edge-can-carry-both-hops
+    /// Rejects a shared edge only where the carrier cannot take one. See
+    /// [`SharedEdge`] for why WireGuard and MASQUE answer this differently.
+    fn checked(self, shared: SharedEdge) -> Result<Self> {
         match (self.outer, self.inner) {
-            (Some(outer), Some(inner)) if outer.ip() == inner.ip() => {
+            (Some(outer), Some(inner))
+                if shared == SharedEdge::Refused && outer.ip() == inner.ip() =>
+            {
                 Err(AetherError::Other(format!(
                     "the two hops need separate edges, but both point at {}",
                     outer.ip()
@@ -317,6 +355,7 @@ impl WiwEndpoints {
             _ => Ok(self),
         }
     }
+    // <<< AETHER-APP-FIX one-edge-can-carry-both-hops
 }
 
 /// Reads one endpoint. The port has to be written out: which port answers is
@@ -399,12 +438,20 @@ fn scan_keyword(value: &str) -> bool {
     )
 }
 
+// >>> AETHER-APP-FIX one-edge-can-carry-both-hops
+/// Reads the endpoints a nested carrier was handed on the command line.
+///
+/// `shared` is the caller's answer to "may one edge carry both hops?" — it is
+/// what keeps the WireGuard relaxation from leaking into MASQUE, which shares
+/// this parser. See [`SharedEdge`].
 fn nested_endpoints_of(
     lookup: &dyn Fn(&str) -> Option<String>,
     list_key: &str,
     outer_key: &str,
     inner_key: &str,
+    shared: SharedEdge,
 ) -> Result<WiwEndpoints> {
+    // <<< AETHER-APP-FIX one-edge-can-carry-both-hops
     let mut chosen = WiwEndpoints::default();
 
     if let Some(list) = lookup(list_key) {
@@ -423,7 +470,7 @@ fn nested_endpoints_of(
         chosen.inner = Some(parse_endpoint(&value)?);
     }
 
-    chosen.checked()
+    chosen.checked(shared)
 }
 
 fn wiw_endpoints_of(lookup: &dyn Fn(&str) -> Option<String>) -> Result<WiwEndpoints> {
@@ -432,6 +479,9 @@ fn wiw_endpoints_of(lookup: &dyn Fn(&str) -> Option<String>) -> Result<WiwEndpoi
         "AETHER_WIW_PEERS",
         "AETHER_WIW_OUTER_PEER",
         "AETHER_WIW_INNER_PEER",
+        // WireGuard tells two tunnels apart by public key, so one edge may
+        // carry both hops.
+        SharedEdge::Allowed,
     )
 }
 
@@ -445,6 +495,10 @@ fn mim_endpoints_of(lookup: &dyn Fn(&str) -> Option<String>) -> Result<WiwEndpoi
         "AETHER_MIM_PEERS",
         "AETHER_MIM_OUTER_PEER",
         "AETHER_MIM_INNER_PEER",
+        // A MASQUE edge validates the client certificate, so it may not accept
+        // a second identity. The two hops stay separate here — this is the one
+        // place where the old rule was right, and it is kept.
+        SharedEdge::Refused,
     )
 }
 
@@ -472,13 +526,112 @@ fn wiw_endpoints_with_fallback(lookup: &dyn Fn(&str) -> Option<String>) -> Resul
         chosen.inner = peers.get(1).copied();
     }
 
-    chosen.checked()
+    // `--peer`/`--wg-peer` name a WireGuard hop, so a shared edge is allowed
+    // here for the same reason it is in `wiw_endpoints_of`. Note the case this
+    // covers: one address written once lands as both `outer` and `inner`, and
+    // that used to be rejected as a mistake rather than accepted as the
+    // single-edge tunnel it is.
+    chosen.checked(SharedEdge::Allowed)
 }
+
+// >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+/// Read back the outer edge warp-in-warp used last time, and check it still
+/// answers before handing it to [`run_warp_in_warp`].
+///
+/// ## Verified, not trusted
+///
+/// A cached address that has since been blocked would otherwise be handed
+/// straight to `run_warp_in_warp`, which fails, comes back through the loop,
+/// and only *then* scans — so the shortcut would have cost a delay instead of
+/// saving one. The mobile core learned this the expensive way and writes it
+/// down; the reuse check is what makes the shortcut a shortcut.
+///
+/// ## Why the profile is not negotiable
+///
+/// The check must run under the settings the connection will actually use. The
+/// outer hop is raised by `establish_wg(.., obfuscate = true, ..)`, which
+/// resolves [`primary_aethernoize_profile`] and never varies it. Verifying under
+/// any other profile would prove something about a connection nobody is going
+/// to make.
+async fn load_cached_gool_peer(
+    lastconn_path: &str,
+    primary: &account::Identity,
+) -> Option<SocketAddr> {
+    let cached = lastconn::load(lastconn_path)?;
+    let peer = cached.peer.parse::<SocketAddr>().ok()?;
+
+    if !want_quick_reconnect(&cached).await {
+        return None;
+    }
+
+    let private_key = primary.private_key_bytes().ok()?;
+    let peer_public = primary.peer_public_key_bytes().ok()?;
+    let ipv4: std::net::Ipv4Addr = primary.ipv4.parse().ok()?;
+
+    log::info!("[*] verifying cached outer WARP endpoint {peer} before reuse");
+    let profile = aethernoize::from_profile(&primary_aethernoize_profile());
+
+    match wireguard::verify_endpoint(
+        peer,
+        private_key,
+        peer_public,
+        primary.client_id,
+        ipv4,
+        &profile,
+        std::time::Duration::from_secs(6),
+        None,
+    )
+    .await
+    {
+        Ok(rtt) => {
+            log::info!(
+                "[+] cached outer endpoint {peer} still works (rtt {rtt:?}); skipping scan"
+            );
+            Some(peer)
+        }
+        Err(e) => {
+            log::warn!("[-] cached outer endpoint {peer} no longer works ({e}); scanning fresh");
+            None
+        }
+    }
+}
+
+/// Read back the outer MASQUE edge masque-in-masque used last time, and check
+/// it still answers.
+///
+/// Exactly what [`load_cached_gool_peer`] does for warp-in-warp, for the same
+/// reason: an address that no longer answers must not be handed straight to
+/// `run_masque_in_masque`. The check is a full MASQUE pre-flight, so what comes
+/// back is an edge that has just accepted our identity — not merely an edge
+/// that is reachable.
+async fn load_cached_mim_peer(
+    lastconn_path: &str,
+    primary: &account::Identity,
+) -> Option<SocketAddr> {
+    let cached = lastconn::load(lastconn_path)?;
+    let peer = cached.peer.parse::<SocketAddr>().ok()?;
+
+    if !want_quick_reconnect(&cached).await {
+        return None;
+    }
+
+    log::info!("[*] verifying cached outer MASQUE edge {peer} before reuse");
+
+    if quick_verify_masque_peer(primary, peer).await {
+        log::info!("[+] cached outer edge {peer} still works; skipping scan");
+        Some(peer)
+    } else {
+        log::warn!("[-] cached outer edge {peer} no longer works; scanning fresh");
+        None
+    }
+}
+// <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
 
 async fn run_gool(
     primary: account::Identity,
     secondary: account::Identity,
     listen: SocketAddr,
+    lastconn_path: String,
 ) -> Result<()> {
     // Scanning is what happens unless somebody named an endpoint themselves.
     let pinned = wiw_endpoints_with_fallback(&env_value)?;
@@ -501,6 +654,22 @@ async fn run_gool(
     let mut consecutive_fails: u32 = 0;
     const MAX_CONSECUTIVE_FAILS: u32 = 2;
     let mut scan_settings: Option<(String, prober::IpScan)> = None;
+
+    // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+    // The outer edge that worked the last time this identity connected, read
+    // back from a previous run of the process and re-verified before use.
+    //
+    // `outer_peer` only remembers within one run, so without this every start
+    // paid for a full scan — and the cost of that scan is our own scan budget,
+    // not the network's, which is why it was the same number of seconds every
+    // time. Skipped entirely when the user named an endpoint: a hand-picked hop
+    // is not ours to replace.
+    let mut cached_peer = if pinned.outer.is_none() {
+        load_cached_gool_peer(&lastconn_path, &primary).await
+    } else {
+        None
+    };
+    // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
 
     loop {
         if consecutive_fails >= MAX_CONSECUTIVE_FAILS {
@@ -532,10 +701,17 @@ async fn run_gool(
                 );
             }
 
+            // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+            // A blacklisted edge must not come back through the cache on the
+            // next turn of this loop. Without this, blacklisting and caching
+            // undo each other and the loop never actually replaces the edge.
+            cached_peer = None;
+            // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+
             consecutive_fails = 0;
         }
 
-        let (peer, inner_peer_now) = match (outer_peer, inner_peer) {
+        let (peer, inner_peer_now) = match (outer_peer.or(cached_peer), inner_peer) {
             (Some(outer), Some(inner)) => (outer, inner),
             (known_outer, known_inner) => {
                 let wanted =
@@ -570,10 +746,23 @@ async fn run_gool(
 
                 match (outer, inner) {
                     (Some(outer), Some(inner)) => (outer, inner),
-                    _ => {
+                    // >>> AETHER-APP-FIX one-edge-can-carry-both-hops
+                    // One edge is not half a tunnel. A network that offers
+                    // exactly one reachable edge is the case this change exists
+                    // for, so the single edge the scan found carries both hops
+                    // instead of the loop rescanning until its budget is gone —
+                    // which is what it used to do, and what the 2026-09-22 log
+                    // shows it doing.
+                    (Some(edge), None) | (None, Some(edge)) => {
                         log::warn!(
-                            "[-] the scan only turned up one edge, so warp-in-warp would use it twice; rescanning"
+                            "[-] the scan turned up a single edge ({edge}); carrying both hops on it \
+                             rather than rescanning"
                         );
+                        (edge, edge)
+                    }
+                    // <<< AETHER-APP-FIX one-edge-can-carry-both-hops
+                    (None, None) => {
+                        log::warn!("[-] the scan turned up no edge at all; rescanning");
                         outer_peer = pinned.outer;
                         inner_peer = pinned.inner;
                         tokio::time::sleep(wg_reconnect_delay()).await;
@@ -583,9 +772,32 @@ async fn run_gool(
             }
         };
 
-        log::info!("[+] using cloudflare edge {peer} (outer) and {inner_peer_now} (inner)");
+        // >>> AETHER-APP-FIX one-edge-can-carry-both-hops
+        // Said out loud, because "one edge, both hops" is exactly the line a
+        // field log needs to show when a session succeeds on a network that
+        // offers nothing else.
+        if peer.ip() == inner_peer_now.ip() {
+            log::info!("[+] using cloudflare edge {peer} (outer and inner — the only edge this network offers)");
+        } else {
+            log::info!("[+] using cloudflare edge {peer} (outer) and {inner_peer_now} (inner)");
+        }
+        // <<< AETHER-APP-FIX one-edge-can-carry-both-hops
         outer_peer = Some(peer);
         inner_peer = Some(inner_peer_now);
+
+        // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+        // Saved *before* the tunnel is raised, not after. The outer edge has
+        // already passed a handshake and a data-plane check by this point, and
+        // `run_warp_in_warp` only returns when the whole session ends — waiting
+        // for that would mean never recording an edge that worked for hours.
+        if pinned.outer.is_none() {
+            lastconn::save(
+                &lastconn_path,
+                &peer.to_string(),
+                &primary_aethernoize_profile(),
+            );
+        }
+        // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
 
         match run_warp_in_warp(
             primary.clone(),
@@ -626,8 +838,23 @@ fn noize_config() -> noize::NoizeConfig {
     noize::from_profile(&profile)
 }
 
+// >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+/// The aethernoize profile name that non-varying WireGuard hops are raised
+/// with.
+///
+/// One source of truth on purpose. [`aethernoize_config`] builds the config the
+/// hops actually use, and the nested caches record *this name* next to the peer
+/// they remember — so the reuse check can prove the cached peer was validated
+/// under the very settings the connection is about to use. A second copy of the
+/// default would be a second thing to keep in sync, and the failure mode of
+/// drift here is a cache that "verifies" a peer under settings nobody uses.
+fn primary_aethernoize_profile() -> String {
+    std::env::var("AETHER_NOIZE").unwrap_or_else(|_| "balanced".to_string())
+}
+// <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+
 fn aethernoize_config() -> aethernoize::AetherNoizeConfig {
-    let profile = std::env::var("AETHER_NOIZE").unwrap_or_else(|_| "balanced".to_string());
+    let profile = primary_aethernoize_profile();
     log::info!("[+] aethernoize profile: {profile}");
     aethernoize::from_profile(&profile)
 }
@@ -1246,6 +1473,29 @@ fn lastconn_path(config_path: &str) -> String {
     derive_sibling_path(config_path, "lastconn")
 }
 
+// >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+/// Where warp-in-warp remembers its outer edge.
+///
+/// Deliberately not `lastconn_path`, even though both hold a WireGuard endpoint
+/// discovered with the same identity. Plain WireGuard stores the obfuscation
+/// profile that worked and *varies* it across retries; the nested tunnels raise
+/// their outer hop with one fixed profile and never vary it. Sharing a file
+/// would mean each protocol reading back a peer that was validated under
+/// settings the other never used — and then treating that as proof.
+fn gool_lastconn_path(config_path: &str) -> String {
+    derive_sibling_path(config_path, "gool-lastconn")
+}
+
+/// Where masque-in-masque remembers its outer edge.
+///
+/// Its own file for the same reason GOOL has one: the peer is a MASQUE edge,
+/// validated by a MASQUE handshake, and a WireGuard cache has nothing useful to
+/// say about it.
+fn mim_lastconn_path(config_path: &str) -> String {
+    derive_sibling_path(config_path, "mim-lastconn")
+}
+// <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+
 /// Fallback verification timeout for peers that are NOT subject to the quick
 /// reconnect handshake budget (a forced peer, an organization-assigned endpoint,
 /// or the last known-good gateway of a live session).
@@ -1646,44 +1896,142 @@ fn mim_inner_startup() -> std::time::Duration {
     masque_startup_timeout().min(std::time::Duration::from_secs(12))
 }
 
+/// Candidate edges for the inner hop of MASQUE-in-MASQUE.
+///
+/// ## The order matters, and it used to be random
+///
+/// The old body picked six hosts uniformly at random inside the outer hop's
+/// `/24`, which is not a pool of MASQUE edges - it is just an address block. On
+/// the 2026-09-22 log that produced four straight TLS `handshake_failure`
+/// results (QUIC `0x128`, i.e. `CRYPTO_ERROR` carrying alert 40) against
+/// `.153`, `.235`, `.216` and `.46`, none of which serve the MASQUE hostname,
+/// while the outer hop was happily running against `.2` of the same block.
+///
+/// The pool is now, in order:
+///
+/// 1. **Edges this session has already proven** ([`prober::proven_gateways`]) -
+///    each one completed a real MASQUE handshake moments ago.
+/// 2. **The documented MASQUE seed pool** ([`prober::MASQUE_SEEDS`]) - the same
+///    addresses the outer scan trusts, minus the outer hop itself.
+///
+/// And nothing else. The random `/24` tier that used to sit at the bottom is
+/// gone, not merely demoted. *"Never a random guess"* is the rule the mobile
+/// core arrived at after the same defect, and the reason it applies here is
+/// that a tier only reached when the real pools run dry is reached precisely
+/// when the network is at its most hostile - which is when guessing costs the
+/// most.
+///
+/// A short pool is no longer a problem. When both tiers come up empty the list
+/// is empty, and [`order_inner_candidates`] answers by appending the outer hop
+/// itself: one address this network has *proven* it can reach, instead of six
+/// it has not.
+///
+/// The outer hop is still excluded from these two tiers, because a nested
+/// pipeline prefers a second edge. What changed is that "second edge" now means
+/// *a known edge other than the first*, instead of *an arbitrary address*.
 fn inner_masque_candidates(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
-    use rand::RngExt;
-
-    let mut rng = rand::rng();
     let mut out: Vec<SocketAddr> = Vec::new();
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    let want_v6 = outer.is_ipv6();
 
-    match outer.ip() {
-        IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            let mut hosts: Vec<u8> = (1..=254u8).filter(|host| *host != octets[3]).collect();
-            for index in (1..hosts.len()).rev() {
-                let other = rng.random_range(0..=index);
-                hosts.swap(index, other);
-            }
-            for host in hosts.into_iter().take(count) {
-                let ip = Ipv4Addr::new(octets[0], octets[1], octets[2], host);
-                out.push(SocketAddr::new(IpAddr::V4(ip), MASQUE_INNER_PORT));
-            }
+    let mut push = |out: &mut Vec<SocketAddr>, seen: &mut HashSet<SocketAddr>, addr: SocketAddr| {
+        if addr.ip() == outer.ip() || out.len() >= count {
+            return;
         }
-        IpAddr::V6(v6) => {
-            let mut segments = v6.segments();
-            let last = segments[7];
-            let mut seen: HashSet<u16> = HashSet::new();
-            while out.len() < count && seen.len() < count * 8 {
-                let candidate = rng.random_range(1..=u16::MAX);
-                if candidate == last || !seen.insert(candidate) {
-                    continue;
-                }
-                segments[7] = candidate;
-                out.push(SocketAddr::new(
-                    IpAddr::V6(std::net::Ipv6Addr::from(segments)),
-                    MASQUE_INNER_PORT,
-                ));
-            }
+        if seen.insert(addr) {
+            out.push(addr);
+        }
+    };
+
+    // >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+    // 1) Proven this session.
+    for addr in prober::proven_gateways() {
+        if addr.is_ipv6() == want_v6 {
+            push(&mut out, &mut seen, addr);
         }
     }
 
+    // 2) The documented seed pool for this address family.
+    let seeds: &[&str] = if want_v6 {
+        prober::MASQUE_SEEDS_V6
+    } else {
+        prober::MASQUE_SEEDS
+    };
+    for seed in seeds {
+        if let Ok(ip) = seed.parse::<IpAddr>() {
+            if ip.is_ipv6() == want_v6 {
+                push(&mut out, &mut seen, SocketAddr::new(ip, MASQUE_INNER_PORT));
+            }
+        }
+    }
+    // <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+
+    // >>> AETHER-APP-FIX never-a-random-guess
+    // The random `/24` tier that stood here is gone rather than demoted.
+    // `count` is now an upper bound, not a quota to fill: a short list is
+    // correct, because every address in it has evidence behind it and the
+    // outer-hop fallback in `order_inner_candidates` covers the shortfall.
+    // <<< AETHER-APP-FIX never-a-random-guess
+
     out
+}
+
+/// Order the inner-hop candidates, keeping the outer hop as the *last* resort
+/// instead of dropping it.
+///
+/// ## Why the outer hop is no longer excluded
+///
+/// [`inner_masque_candidates`] deliberately leaves the outer hop out of the pool,
+/// on the reasoning that a nested pipeline wants a *second* edge. On the
+/// 2026-09-22 log that reasoning cost the session. The outer hop was running
+/// against `162.159.198.2` - the one address on that network *proven* to serve
+/// the MASQUE hostname, with a live handshake in flight - while all six inner
+/// candidates came from elsewhere and four of them answered TLS
+/// `handshake_failure` (QUIC `0x128`, alert 40). The list ran out and the tunnel
+/// that could have been built was thrown away.
+///
+/// So the rule is now: a *different* edge is still preferred and is tried first,
+/// but the outer hop is kept as the final fallback. A MASQUE-in-MASQUE tunnel
+/// whose two hops share an edge is still a real nested tunnel - the inner hop
+/// runs inside the outer hop's netstack either way - and it is strictly better
+/// than ending at "no inner masque edge answered through the outer tunnel".
+///
+/// The transform is deterministic and preserves input order:
+///
+/// * candidates whose IP differs from the outer hop keep their position;
+/// * a candidate whose IP *is* the outer hop is moved to the end (there is at
+///   most one, and it is the address we already know answers);
+/// * if no candidate shares the outer hop's IP, the outer hop itself is appended
+///   once, at the end;
+/// * duplicates are removed.
+///
+/// Note that the outer hop is appended with its own port, not
+/// [`MASQUE_INNER_PORT`]: when we fall back to it we fall back to the exact
+/// endpoint that is already carrying the outer tunnel.
+fn order_inner_candidates(outer: SocketAddr, candidates: &[SocketAddr]) -> Vec<SocketAddr> {
+    let mut preferred: Vec<SocketAddr> = Vec::with_capacity(candidates.len() + 1);
+    let mut fallback: Option<SocketAddr> = None;
+
+    for candidate in candidates {
+        if candidate.ip() == outer.ip() {
+            // Same host as the outer hop: it is the last resort, not the first
+            // choice. Keep the first such entry we are handed.
+            if fallback.is_none() {
+                fallback = Some(*candidate);
+            }
+            continue;
+        }
+        if !preferred.contains(candidate) {
+            preferred.push(*candidate);
+        }
+    }
+
+    match fallback {
+        Some(edge) => preferred.push(edge),
+        None => preferred.push(outer),
+    }
+
+    preferred
 }
 
 async fn spawn_tcp_forwarder(
@@ -1727,6 +2075,42 @@ async fn spawn_tcp_forwarder(
     Ok((local, TaskGuard(vec![task.abort_handle()])))
 }
 
+// >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+/// Which hop of a masque-in-masque tunnel failed.
+///
+/// The distinction is the entire point of this type. Both failures used to
+/// arrive as one `AetherError`, so the reconnect loop could not tell a dead
+/// *outer* edge from an inner pool that simply ran out — and it answered the
+/// second by blacklisting and rescanning a perfectly healthy outer. The mobile
+/// core records what that costs: two inner refusals blacklisted a healthy
+/// outer, the rescan storm that followed poisoned the carrier network, and
+/// MASQUE never connected once that night.
+///
+/// The boundary is drawn where the mobile core draws it:
+///
+/// * raising the **outer** hop, or losing its userspace stack, is an
+///   [`MimHopFailure::Outer`];
+/// * every inner candidate refusing, or a mid-session death on the inner hop,
+///   is an [`MimHopFailure::Inner`];
+/// * one inner candidate that cannot be dialled *through the outer stack* is
+///   neither. The outer stack being up is what makes it an inner-pool question
+///   at all, so that candidate is skipped and the next one is tried.
+#[derive(Debug)]
+enum MimHopFailure {
+    Outer(String),
+    Inner(String),
+}
+
+impl std::fmt::Display for MimHopFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MimHopFailure::Outer(m) => write!(f, "outer hop: {m}"),
+            MimHopFailure::Inner(m) => write!(f, "inner hop: {m}"),
+        }
+    }
+}
+// <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+
 async fn run_masque_in_masque(
     primary: &account::Identity,
     secondary: &account::Identity,
@@ -1734,7 +2118,7 @@ async fn run_masque_in_masque(
     inner_peers: &[SocketAddr],
     ech: Option<Vec<u8>>,
     listen: SocketAddr,
-) -> Result<()> {
+) -> std::result::Result<SocketAddr, MimHopFailure> {
     let h2 = masque_h2::enabled();
     let outer_mtu = masque_tunnel_mtu();
 
@@ -1750,15 +2134,16 @@ async fn run_masque_in_masque(
         masque_startup_timeout(),
         "outer",
     )
-    .await?;
+    .await
+    .map_err(|e| MimHopFailure::Outer(e.to_string()))?;
 
     let mut chosen: Option<(SocketAddr, MasqueHop, TaskGuard)> = None;
 
-    for inner_peer in inner_peers
-        .iter()
-        .copied()
-        .filter(|candidate| candidate.ip() != peer.ip())
-    {
+    // >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+    let ordered = order_inner_candidates(peer, inner_peers);
+    // <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+
+    for inner_peer in ordered {
         let (inner_datagram, inner_mtu) = mim_inner_budget(outer_mtu, inner_peer, h2);
 
         if !h2 && inner_datagram + 28 > outer_mtu {
@@ -1768,11 +2153,38 @@ async fn run_masque_in_masque(
             );
         }
 
+        // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+        // A dial that cannot be bound through the outer stack is not a verdict
+        // on the outer hop: the outer stack is up (we are standing on it) and
+        // it is the thing this dial rides. So this candidate is skipped and the
+        // next one is tried, instead of the whole attempt being thrown away.
+        // This used to be a `?`, which turned one unreachable inner candidate
+        // into a failed attempt — and, before the classification existed, into
+        // a strike against the outer edge.
         let (forwarder, forwarder_guard) = if h2 {
-            spawn_tcp_forwarder(&outer.stack, inner_peer).await?
+            match spawn_tcp_forwarder(&outer.stack, inner_peer).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    log::info!(
+                        "[-] inner edge {inner_peer} could not be reached through the outer \
+                         tunnel ({e}); trying the next known edge"
+                    );
+                    continue;
+                }
+            }
         } else {
-            spawn_udp_forwarder(&outer.stack, inner_peer).await?
+            match spawn_udp_forwarder(&outer.stack, inner_peer).await {
+                Ok(ok) => ok,
+                Err(e) => {
+                    log::info!(
+                        "[-] inner edge {inner_peer} could not be reached through the outer \
+                         tunnel ({e}); trying the next known edge"
+                    );
+                    continue;
+                }
+            }
         };
+        // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
         log::info!(
             "[*] trying inner MASQUE edge {inner_peer} through the outer tunnel via {forwarder}"
         );
@@ -1795,20 +2207,53 @@ async fn run_masque_in_masque(
                 chosen = Some((inner_peer, hop, forwarder_guard));
                 break;
             }
-            Err(e) => log::info!(
-                "[-] inner edge {inner_peer} does not serve masque from inside the tunnel: {e}"
-            ),
+            // >>> AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
+            // The old wording - "does not serve masque from inside the tunnel" -
+            // asserted a conclusion the log did not support. When the edge
+            // rejects the TLS handshake (QUIC `CRYPTO_ERROR`, 0x100-0x1ff, low
+            // byte = the TLS alert) that is a statement about *this address*,
+            // not about MASQUE-over-WARP being impossible. Naming the actual
+            // failure is what makes the next log diagnosable.
+            Err(e) => {
+                let detail = e.to_string();
+                if let Some(alert) = quic::tls_alert_in(&detail) {
+                    log::info!(
+                        "[-] inner edge {inner_peer} refused the TLS handshake (alert {alert}); \
+                         trying the next known edge"
+                    );
+                } else {
+                    log::info!(
+                        "[-] inner edge {inner_peer} did not complete a MASQUE handshake: {detail}"
+                    );
+                }
+            }
+            // <<< AETHER-APP-FIX an-inner-hop-wants-a-proven-edge
         }
     }
 
     let Some((inner_peer, mut inner, _forwarder_guard)) = chosen else {
-        return Err(AetherError::Other(
+        // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+        // Every candidate refused. The outer hop answered CONNECT-IP moments
+        // ago, so this is an inner-pool failure and must be attributed as one —
+        // otherwise the reconnect loop blacklists and rescans a healthy outer.
+        return Err(MimHopFailure::Inner(
             "no inner masque edge answered through the outer tunnel".into(),
         ));
+        // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
     };
 
-    let socks_listener = socks::bind_listener("socks5", listen).await?;
-    let http_listener = bind_http_proxy().await?;
+    // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+    // Both hops are up at this point; what can still fail here is local
+    // (a listener that cannot bind). Attributed to the inner hop on purpose:
+    // it keeps the outer edge, which has just proven itself, out of the
+    // blacklist for a fault that was never its own.
+    let socks_listener = socks::bind_listener("socks5", listen)
+        .await
+        .map_err(|e| MimHopFailure::Inner(e.to_string()))?;
+    let http_listener = bind_http_proxy()
+        .await
+        .map_err(|e| MimHopFailure::Inner(e.to_string()))?;
+    // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
 
     let mut tasks = TaskGuard::new();
     let http_task = spawn_http_proxy(http_listener, &inner.stack);
@@ -1849,7 +2294,23 @@ async fn run_masque_in_masque(
         let _ = (&mut socks_task).await;
     }
 
-    outcome
+    // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+    // A session that ends was still a WORKING session: it carried traffic
+    // through both hops. So the chosen inner edge is reported back on success —
+    // the caller remembers it — and a mid-session death is attributed to the
+    // hop that died, so the hop that was healthy is not rescanned because of it.
+    //
+    // `Socks` counts as inner for the same reason the mobile core counts its
+    // local listener as inner: the failure is inside the tunnel we built, not a
+    // statement about the edge that carries it.
+    match outcome {
+        Ok(()) => Ok(inner_peer),
+        Err(e) => Err(match winner {
+            Winner::Outer => MimHopFailure::Outer(e.to_string()),
+            Winner::Inner | Winner::Socks => MimHopFailure::Inner(e.to_string()),
+        }),
+    }
+    // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
 }
 
 async fn run_mim(
@@ -1857,6 +2318,7 @@ async fn run_mim(
     secondary: account::Identity,
     ech: Option<Vec<u8>>,
     listen: SocketAddr,
+    lastconn_path: String,
 ) -> Result<()> {
     let pinned = mim_endpoints_from_env()?;
 
@@ -1874,13 +2336,42 @@ async fn run_mim(
     }
 
     let mut outer_peer = pinned.outer;
-    let mut inner_peer = pinned.inner;
+    // No longer `mut`: the inner hop is not blacklisted by a counter any more,
+    // so a hand-picked inner endpoint stays picked. Inner variation happens
+    // through the candidate pool and `last_inner` instead.
+    let inner_peer = pinned.inner;
     let mut consecutive_fails: u32 = 0;
     let mut scan_settings: Option<(String, prober::IpScan)> = None;
     const MAX_CONSECUTIVE_FAILS: u32 = 2;
+    // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+    // The inner edge that last carried a session through this outer. It is the
+    // strongest evidence the pool can hold — it was chosen, and it worked — so
+    // the next attempt tries it first. Dropped the moment an inner hop fails,
+    // because then it may be the dead one. See [`MimHopFailure`].
+    let mut last_inner: Option<SocketAddr> = None;
+    // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+
+    // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+    // The outer MASQUE edge that worked last time, read back from a previous
+    // run and re-verified before use — same shape as `run_gool`'s cache, and
+    // skipped when the user named an endpoint.
+    let mut cached_peer = if pinned.outer.is_none() {
+        load_cached_mim_peer(&lastconn_path, &primary).await
+    } else {
+        None
+    };
+    // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
 
     loop {
         if consecutive_fails >= MAX_CONSECUTIVE_FAILS {
+            // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+            // This counter now moves on *outer* failures only, so the edge it
+            // blacklists is the edge that actually failed. The inner hop is not
+            // blacklisted here any more: an inner refusal drops the remembered
+            // inner edge and lets the pool vary, which is the change
+            // [`MimHopFailure`] exists to make. Before it, this block also
+            // discarded a hand-picked inner endpoint after two failures of any
+            // kind — including two failures that were the outer hop's fault.
             if pinned.outer.is_none() {
                 if let Some(peer) = outer_peer.take() {
                     log::warn!(
@@ -1888,17 +2379,16 @@ async fn run_mim(
                     );
                 }
             }
-            if pinned.inner.is_none() {
-                if let Some(peer) = inner_peer.take() {
-                    log::warn!(
-                        "[-] inner edge {peer} failed {consecutive_fails} times in a row; trying another"
-                    );
-                }
-            }
+            // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
+            // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+            // A blacklisted edge must not come back through the cache on the
+            // next turn of this loop.
+            cached_peer = None;
+            // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
             consecutive_fails = 0;
         }
 
-        let outer = match outer_peer {
+        let outer = match outer_peer.or(cached_peer) {
             Some(peer) => peer,
             None => {
                 let (mode_str, ip) = match &scan_settings {
@@ -1921,19 +2411,48 @@ async fn run_mim(
             }
         };
 
+        // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
         let candidates = match inner_peer {
             Some(peer) => vec![peer],
-            None => inner_masque_candidates(outer, MIM_INNER_TRIES),
+            None => {
+                let pool = inner_masque_candidates(outer, MIM_INNER_TRIES);
+                // The inner edge that already carried a session through this
+                // outer goes first — it is the strongest evidence the pool can
+                // hold. Prepended only when it is absent, so the list stays
+                // duplicate-free.
+                match last_inner {
+                    Some(preferred) if !pool.iter().any(|candidate| *candidate == preferred) => {
+                        std::iter::once(preferred).chain(pool).collect()
+                    }
+                    _ => pool,
+                }
+            }
         };
 
+        // An empty pool is no longer fatal. It used to `return Err`, which
+        // ended the entire reconnect loop over a pool that
+        // [`order_inner_candidates`] can still fill with the outer edge — the
+        // one address on this network already known to answer.
         if candidates.is_empty() {
-            return Err(AetherError::Other(
-                "no second masque edge is known for the inner hop".into(),
-            ));
+            log::warn!(
+                "[-] no verified inner edge is known; falling back to the outer edge {outer}"
+            );
         }
+        // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
 
         outer_peer = Some(outer);
 
+        // >>> AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+        // Saved before the tunnel is raised, for the same reason `run_gool`
+        // does it here: the outer edge has already answered a MASQUE pre-flight
+        // by this point, and `run_masque_in_masque` only returns when the whole
+        // session ends.
+        if pinned.outer.is_none() {
+            lastconn::save(&lastconn_path, &outer.to_string(), &lastconn::MIM_OUTER_PROFILE);
+        }
+        // <<< AETHER-APP-FIX a-nested-tunnel-remembers-its-edge
+
+        // >>> AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
         match run_masque_in_masque(
             &primary,
             &secondary,
@@ -1944,10 +2463,35 @@ async fn run_mim(
         )
         .await
         {
-            Ok(()) => log::warn!("[-] masque-in-masque tunnel closed; reconnecting"),
-            Err(e) => log::warn!("[-] masque-in-masque tunnel ended: {e}; reconnecting"),
+            Ok(inner_edge) => {
+                log::warn!(
+                    "[-] masque-in-masque session through {outer}/{inner_edge} ended; reconnecting"
+                );
+                // It carried traffic, so the inner edge it chose is worth
+                // remembering even though the session ended.
+                last_inner = Some(inner_edge);
+                consecutive_fails = 0;
+            }
+            Err(MimHopFailure::Outer(e)) => {
+                // Only a genuinely dead OUTER hop pays here. This is the
+                // counter that used to move on a failure of any kind: two inner
+                // refusals blacklisted a healthy outer and started the scan
+                // storm that took the carrier network down with it.
+                log::warn!("[-] outer hop {outer} failed — {e}; reconnecting");
+                consecutive_fails += 1;
+            }
+            Err(MimHopFailure::Inner(e)) => {
+                // Inner failure with a live outer: keep the outer, drop the
+                // remembered inner (it may be the dead one), retry soon. The
+                // counter deliberately does not move — the outer edge is not
+                // what failed, and blacklisting it is the bug this fixes.
+                log::warn!("[-] inner hop failed — {e}; keeping outer edge {outer}");
+                if let Some(known) = last_inner.take() {
+                    log::warn!("[-] dropping remembered inner edge {known}");
+                }
+            }
         }
-        consecutive_fails += 1;
+        // <<< AETHER-APP-FIX an-inner-refusal-is-not-an-outer-failure
 
         tokio::time::sleep(masque_reconnect_delay()).await;
     }
@@ -2531,8 +3075,16 @@ async fn establish_wg(
     mtu: usize,
     obfuscate: bool,
     keepalive: u16,
+    stale: std::time::Duration,
     label: &'static str,
 ) -> Result<(netstack::StackHandle, TunnelExit)> {
+    // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+    // A hop whose keepalive is longer than the budget it is given before being
+    // judged dead is guaranteed to be judged dead while its keepalive is still
+    // pending. The clamp is applied here, at the one place every hop goes
+    // through, instead of trusting each call site to do the arithmetic.
+    let keepalive = wireguard::clamp_keepalive_to_stale(keepalive, stale);
+    // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
     let private_key = identity.private_key_bytes()?;
     let peer_public = identity.peer_public_key_bytes()?;
 
@@ -2565,11 +3117,12 @@ async fn establish_wg(
     let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
     let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel(packet_queue_capacity());
 
-    let tunnel = wireguard::WgTunnel::from_established(
+    let tunnel = wireguard::WgTunnel::from_established_with_stale(
         session,
         std::sync::Arc::new(profile),
         inbound_tx,
         ipv4,
+        stale,
     );
     let stack = netstack::spawn(&identity.ipv4, &identity.ipv6, mtu, inbound_rx, outbound_tx)?;
 
@@ -2692,6 +3245,29 @@ async fn spawn_udp_forwarder(
     Ok((local, guard))
 }
 
+// >>> AETHER-APP-FIX let-the-carrier-settle-before-the-forwarder
+/// How long the outer hop is left alone before the inner hop's forwarder is
+/// started on top of it.
+///
+/// Not a timeout and not a retry budget: a settle window. The outer WireGuard
+/// session has just completed its handshake and the forwarder is about to push
+/// the inner hop's first packets through it. The mobile core does the same
+/// thing between `establish_wg` and `spawn_udp_forwarder`, and a first inner
+/// handshake that arrives before the outer session has settled is a handshake
+/// that has to be retried.
+///
+/// `AETHER_WG_INNER_SETTLE_MS` overrides it, and `0` removes the wait — so a
+/// field log can tell "the wait helped" from "the wait cost us 1.5 s".
+fn wg_inner_settle() -> std::time::Duration {
+    let ms = std::env::var("AETHER_WG_INNER_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|v| v.min(60_000))
+        .unwrap_or(1500);
+    std::time::Duration::from_millis(ms)
+}
+// <<< AETHER-APP-FIX let-the-carrier-settle-before-the-forwarder
+
 async fn run_warp_in_warp(
     primary: account::Identity,
     secondary: account::Identity,
@@ -2699,26 +3275,60 @@ async fn run_warp_in_warp(
     inner_peer: SocketAddr,
     listen: SocketAddr,
 ) -> Result<()> {
+    // >>> AETHER-APP-FIX one-edge-can-carry-both-hops
+    // `inner_peer` is allowed to equal `peer` — see [`SharedEdge`]. There used
+    // to be a hard error here ("warp-in-warp needs two separate edges"), and it
+    // was the second of two gates that turned "this network offers one edge"
+    // into an endless rescan. Two WireGuard tunnels are told apart by their
+    // public keys, so one edge carrying both is not a mistake to refuse; it is
+    // the single-edge tunnel this network can actually build, and it is
+    // strictly better than ending at "no usable WARP endpoint found".
     if inner_peer.ip() == peer.ip() {
-        return Err(AetherError::Other(format!(
-            "warp-in-warp needs two separate edges but both hops landed on {}",
-            peer.ip()
-        )));
+        log::info!(
+            "[*] one edge carries both hops ({peer} outer, {inner_peer} inner); \
+             the inner tunnel runs inside the outer one either way"
+        );
     }
+    // <<< AETHER-APP-FIX one-edge-can-carry-both-hops
 
     let mut tasks = TaskGuard::new();
 
+    // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+    // Two hops, two different jobs, two different silence budgets.
+    //
+    //   outer = carrier. It only moves the inner hop's packets, so between the
+    //           inner tunnel validating and an application actually using SOCKS5
+    //           it is legitimately silent. Judged on the carrier budget.
+    //   inner = the data path. Everything the user sends crosses it, so it stays
+    //           the hop that fails fast and keeps the short budget.
+    //
+    // The 2026-09-22 log had the outer hop killed after 10.6 s of silence, 2 s
+    // after the inner hop had validated - and then spent the launcher's
+    // remaining window on a fresh scan.
+    let outer_stale = wireguard::carrier_stale_timeout();
+    let inner_stale = wireguard::wg_stale_timeout();
+    // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+
     log::info!("[*] establishing outer WARP tunnel to {peer}...");
     let (outer_stack, mut outer_exit) =
-        establish_wg(&primary, peer, TUNNEL_MTU, true, 5, "outer").await?;
+        establish_wg(&primary, peer, TUNNEL_MTU, true, 5, outer_stale, "outer").await?;
     tasks.push(outer_exit.abort_handle());
+
+    // >>> AETHER-APP-FIX let-the-carrier-settle-before-the-forwarder
+    // The forwarder starts moving the inner hop's packets the moment it exists,
+    // and the outer session has just come up. Letting it settle before the
+    // first inner handshake is cheaper than retrying that handshake against a
+    // session that is still finding its feet. Same shape as the mobile core,
+    // which sleeps between `establish_wg` and `spawn_udp_forwarder`.
+    tokio::time::sleep(wg_inner_settle()).await;
+    // <<< AETHER-APP-FIX let-the-carrier-settle-before-the-forwarder
 
     let (forwarder, _forwarder_guard) = spawn_udp_forwarder(&outer_stack, inner_peer).await?;
     log::info!("[+] inner endpoint {inner_peer} tunneled through outer warp via {forwarder}");
 
     log::info!("[*] establishing inner WARP tunnel (warp-in-warp)...");
     let (inner_stack, mut inner_exit) =
-        establish_wg(&secondary, forwarder, INNER_MTU, false, 20, "inner").await?;
+        establish_wg(&secondary, forwarder, INNER_MTU, false, 20, inner_stale, "inner").await?;
     tasks.push(inner_exit.abort_handle());
 
     let socks_listener = socks::bind_listener("socks5", listen).await?;
@@ -3121,8 +3731,17 @@ mod tests {
         );
     }
 
+    /// The inner hop must aim at addresses that are *known MASQUE edges*, not at
+    /// arbitrary hosts in the outer hop's `/24`.
+    ///
+    /// The previous version of this test asserted the opposite - that every
+    /// candidate shared the outer edge's first three octets. That is exactly the
+    /// assumption the 2026-09-22 log falsified: four candidates drawn from
+    /// `162.159.198.0/24` all answered with TLS `handshake_failure`, because
+    /// sharing a /24 with a working edge says nothing about serving the MASQUE
+    /// hostname.
     #[test]
-    fn the_inner_edges_come_from_the_range_that_answered() {
+    fn the_inner_edges_are_known_masque_edges_not_random_neighbours() {
         let outer: SocketAddr = "162.159.198.104:8443".parse().unwrap();
         let candidates = inner_masque_candidates(outer, MIM_INNER_TRIES);
 
@@ -3134,36 +3753,155 @@ mod tests {
                 "the inner hop needs its own edge"
             );
             assert_eq!(candidate.port(), MASQUE_INNER_PORT);
-            match candidate.ip() {
-                IpAddr::V4(v4) => {
-                    let outer_octets = match outer.ip() {
-                        IpAddr::V4(ip) => ip.octets(),
-                        IpAddr::V6(_) => unreachable!(),
-                    };
-                    assert_eq!(
-                        v4.octets()[..3],
-                        outer_octets[..3],
-                        "same /24 as the edge that worked"
-                    );
-                }
-                IpAddr::V6(_) => unreachable!(),
-            }
         }
 
         let all: HashSet<SocketAddr> = candidates.iter().copied().collect();
         assert_eq!(all.len(), candidates.len(), "candidates must be distinct");
+
+        // The documented seed pool is what a fresh process has to work from, and
+        // it is large enough to fill the list on its own. There is no longer a
+        // tier below it to fall through to - the random-neighbour last resort
+        // was deleted, not demoted - so this now guards the property directly:
+        // every candidate came from evidence, and none from a guess.
+        let seeds: HashSet<SocketAddr> = prober::MASQUE_SEEDS
+            .iter()
+            .filter_map(|s| s.parse::<IpAddr>().ok())
+            .map(|ip| SocketAddr::new(ip, MASQUE_INNER_PORT))
+            .collect();
+        let from_seeds = candidates
+            .iter()
+            .filter(|c| seeds.contains(c))
+            .count();
+        assert!(
+            from_seeds > 0,
+            "the inner hop should be handed real MASQUE edges first, got {candidates:?}"
+        );
+        assert_eq!(
+            candidates.len(),
+            MIM_INNER_TRIES,
+            "the seed pool alone should be able to fill the list"
+        );
     }
 
+    /// A gateway the scan just proved is offered to the inner hop ahead of the
+    /// static seed pool.
+    #[test]
+    fn a_proven_edge_outranks_the_static_seed_pool() {
+        let outer: SocketAddr = "162.159.198.2:443".parse().unwrap();
+        let proven: SocketAddr = "162.159.197.77:443".parse().unwrap();
+        prober::remember_gateway(proven);
+
+        let candidates = inner_masque_candidates(outer, MIM_INNER_TRIES);
+        assert_eq!(
+            candidates.first().copied(),
+            Some(proven),
+            "a gateway that just completed a MASQUE handshake is the best lead there is"
+        );
+        assert!(
+            !candidates.contains(&outer),
+            "the outer hop is still not a candidate for itself"
+        );
+    }
+
+    /// The outer edge here is itself one of the IPv6 seeds, so the pool comes
+    /// back one short of `count`.
+    ///
+    /// That is the correct answer now that no random tier fills the gap: `count`
+    /// is an upper bound, and a list of known edges is better short than padded
+    /// with guesses. `order_inner_candidates` is what covers a short list.
     #[test]
     fn an_ipv6_outer_edge_yields_ipv6_inner_candidates() {
         let outer: SocketAddr = "[2606:4700:d0::a29f:c601]:443".parse().unwrap();
         let candidates = inner_masque_candidates(outer, 4);
 
-        assert_eq!(candidates.len(), 4);
+        let expected: Vec<SocketAddr> = prober::MASQUE_SEEDS_V6
+            .iter()
+            .filter_map(|seed| seed.parse::<IpAddr>().ok())
+            .filter(|ip| *ip != outer.ip())
+            .take(4)
+            .map(|ip| SocketAddr::new(ip, MASQUE_INNER_PORT))
+            .collect();
+
+        assert_eq!(candidates, expected);
+        assert!(candidates.len() < 4, "the outer hop is one of the seeds");
         assert!(candidates.iter().all(|candidate| candidate.is_ipv6()));
         assert!(candidates
             .iter()
             .all(|candidate| candidate.ip() != outer.ip()));
+    }
+
+    /// The outer hop is the last thing the inner hop tries, not something it
+    /// never tries. On the 2026-09-22 log the outer hop was the only *proven*
+    /// MASQUE edge on the network, and excluding it is what emptied the list.
+    #[test]
+    fn the_outer_hop_is_kept_as_the_last_resort_for_the_inner_hop() {
+        let outer: SocketAddr = "162.159.198.2:8443".parse().unwrap();
+        let others: Vec<SocketAddr> = ["162.159.198.153:443", "162.159.198.235:443"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+
+        let ordered = order_inner_candidates(outer, &others);
+
+        assert_eq!(
+            ordered,
+            vec![
+                "162.159.198.153:443".parse().unwrap(),
+                "162.159.198.235:443".parse().unwrap(),
+                outer,
+            ],
+            "a different edge is still preferred, but the outer hop is not thrown away"
+        );
+    }
+
+    /// A different edge keeps the order it was handed in, so the proven-first /
+    /// seeds-second ranking done by `inner_masque_candidates` survives.
+    #[test]
+    fn a_different_edge_keeps_its_place_ahead_of_the_outer_hop() {
+        let outer: SocketAddr = "162.159.198.2:8443".parse().unwrap();
+        let proven: SocketAddr = "162.159.197.77:443".parse().unwrap();
+        let candidate: SocketAddr = "162.159.192.1:443".parse().unwrap();
+
+        let ordered = order_inner_candidates(outer, &[proven, candidate]);
+
+        assert_eq!(ordered.first().copied(), Some(proven));
+        assert_eq!(ordered.last().copied(), Some(outer));
+        assert_eq!(ordered.len(), 3);
+    }
+
+    /// A list that already names the outer hop's host does not get a second copy
+    /// of it - the host is the fallback, and it appears exactly once.
+    #[test]
+    fn the_outer_host_is_offered_once_when_the_list_already_names_it() {
+        let outer: SocketAddr = "162.159.198.2:8443".parse().unwrap();
+        let same_host_other_port: SocketAddr = "162.159.198.2:443".parse().unwrap();
+        let candidate: SocketAddr = "162.159.192.1:443".parse().unwrap();
+
+        let ordered = order_inner_candidates(outer, &[same_host_other_port, candidate]);
+
+        assert_eq!(ordered, vec![candidate, same_host_other_port]);
+        assert_eq!(
+            ordered
+                .iter()
+                .filter(|addr| addr.ip() == outer.ip())
+                .count(),
+            1,
+            "the outer hop's host should be listed once, at the end"
+        );
+    }
+
+    /// A list of only the outer hop still yields one attempt rather than an empty
+    /// loop, and duplicates are collapsed.
+    #[test]
+    fn duplicates_collapse_and_a_lone_outer_hop_still_yields_one_attempt() {
+        let outer: SocketAddr = "162.159.198.2:8443".parse().unwrap();
+        let candidate: SocketAddr = "162.159.192.1:443".parse().unwrap();
+
+        assert_eq!(order_inner_candidates(outer, &[outer]), vec![outer]);
+        assert_eq!(
+            order_inner_candidates(outer, &[candidate, candidate]),
+            vec![candidate, outer]
+        );
     }
 
     #[test]
@@ -3280,15 +4018,40 @@ mod tests {
         assert_eq!(chosen.inner, Some("188.114.96.1:2408".parse().unwrap()));
     }
 
+    /// WireGuard tells two tunnels apart by public key, so one edge may carry
+    /// both hops.
+    ///
+    /// This used to be an error, and that error was one of the two gates that
+    /// turned "this network offers one edge" into an endless rescan. The two
+    /// ports differ here on purpose: the point is that the *host* is shared, not
+    /// that the endpoints are identical.
     #[test]
-    fn one_address_cannot_serve_as_both_hops() {
-        let outcome = wiw_endpoints_of(&env(&[
+    fn one_address_may_serve_as_both_wireguard_hops() {
+        let chosen = wiw_endpoints_of(&env(&[
             ("AETHER_WIW_OUTER_PEER", "162.159.192.1:2408"),
             ("AETHER_WIW_INNER_PEER", "162.159.192.1:894"),
+        ]))
+        .expect("one edge is a legal warp-in-warp");
+
+        assert_eq!(chosen.outer, Some("162.159.192.1:2408".parse().unwrap()));
+        assert_eq!(chosen.inner, Some("162.159.192.1:894".parse().unwrap()));
+    }
+
+    /// The relaxation above belongs to WireGuard alone.
+    ///
+    /// A MASQUE edge validates the client certificate and may not accept a
+    /// second identity, so MASQUE keeps the refusal. Both carriers share
+    /// `nested_endpoints_of`, and this test is what stops the shared parser
+    /// from loosening both at once.
+    #[test]
+    fn one_address_cannot_serve_as_both_masque_hops() {
+        let outcome = mim_endpoints_of(&env(&[
+            ("AETHER_MIM_OUTER_PEER", "162.159.192.1:443"),
+            ("AETHER_MIM_INNER_PEER", "162.159.192.1:8443"),
         ]));
 
         let message = outcome
-            .expect_err("the same edge twice is not warp-in-warp")
+            .expect_err("the same MASQUE edge twice is not masque-in-masque")
             .to_string();
         assert!(
             message.contains("162.159.192.1"),

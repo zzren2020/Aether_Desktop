@@ -399,14 +399,41 @@ pub async fn hunt_wg_endpoints(
                         }
 
 
-                        if st.target_successes > 0 && found >= st.target_successes && quiet_until.is_none() {
-                            log::info!("[+] reached target of {} endpoints, selecting best", st.target_successes);
-                            if !st.quiet_after_first.is_zero() {
-                                quiet_until = Some(Instant::now() + st.quiet_after_first);
-                            } else {
+                        // >>> AETHER-APP-FIX settle-after-the-first-good-gateway
+                        // The window is armed by the FIRST success, not by the
+                        // fifth. This is the same defect the MASQUE prober had,
+                        // and it is fixed the same way, from the same helper: see
+                        // [`crate::prober::settle_window`]. `balanced` asks for
+                        // five endpoints before arming a 12 s settle window, so on
+                        // a network where two or three answer, the window was
+                        // never armed and the scan spent its entire budget
+                        // confirming that the remaining candidates are still
+                        // filtered - while the launcher's window drained away.
+                        // The window is deliberately never extended.
+                        if st.target_successes > 0 && quiet_until.is_none() {
+                            let settle = crate::prober::settle_window(st.quiet_after_first);
+                            if !settle.is_zero() {
+                                if found >= st.target_successes {
+                                    log::info!(
+                                        "[+] reached target of {} endpoints, selecting best",
+                                        st.target_successes
+                                    );
+                                } else {
+                                    log::info!(
+                                        "[+] first working endpoint in hand ({} of {} wanted); \
+                                         giving the scan {:?} more to try to beat it, then \
+                                         selecting - an endpoint in hand beats a longer scan",
+                                        found,
+                                        st.target_successes,
+                                        settle
+                                    );
+                                }
+                                quiet_until = Some(Instant::now() + settle);
+                            } else if found >= st.target_successes {
                                 break;
                             }
                         }
+                        // <<< AETHER-APP-FIX settle-after-the-first-good-gateway
                     }
                 }
             }
