@@ -1469,13 +1469,13 @@ impl AetherController {
     fn begin_verification(&mut self) {
         // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
         // A fresh pipeline gets a fresh retry budget, and a window of its own -
-        // see [`Self::VERIFY_WINDOW_MS`] for why the attempt deadline is the
+        // see [`VERIFY_WINDOW_MS`] for why the attempt deadline is the
         // wrong clock for this phase.
         self.verify_retries = 0;
         let window = if self.profile.is_chained() {
-            Self::VERIFY_WINDOW_CHAINED_MS
+            VERIFY_WINDOW_CHAINED_MS
         } else {
-            Self::VERIFY_WINDOW_MS
+            VERIFY_WINDOW_MS
         };
         self.deadline = Some(Instant::now() + Duration::from_millis(window));
         // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
@@ -1507,7 +1507,7 @@ impl AetherController {
         // the whole window and leave nothing for the re-check.
         let grace = remaining
             .clamp(20_000, ceiling)
-            .min(Self::VERIFY_SAMPLE_GRACE_MAX_MS);
+            .min(VERIFY_SAMPLE_GRACE_MAX_MS);
         // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
         std::thread::Builder::new()
             .name("aether-selftest".into())
@@ -1664,7 +1664,7 @@ impl AetherController {
             Some(d) => d.saturating_duration_since(Instant::now()).as_millis() as u64,
             None => 0,
         };
-        if remaining < Self::VERIFY_RETRY_MIN_REMAINING_MS {
+        if remaining < VERIFY_RETRY_MIN_REMAINING_MS {
             return false;
         }
         probe::socks_ready(engine::exit_socks_port())
