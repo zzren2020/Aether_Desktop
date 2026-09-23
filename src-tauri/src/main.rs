@@ -55,6 +55,7 @@ mod tor_bootstrap;
 mod tor_native;
 // <<< AETHER-APP-PATCH tor-native-carrier
 mod tun;
+mod tun_relay;
 mod window;
 
 use ai_session::{AiSession, AiSnapshot};
