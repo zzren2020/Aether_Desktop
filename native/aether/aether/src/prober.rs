@@ -65,10 +65,10 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
-    "162.159.199.1",
     "162.159.199.2",
     "162.159.198.2",
     "162.159.198.1",
+    "162.159.199.1",
     "162.159.197.1",
     "162.159.204.2",
 ];
@@ -81,10 +81,10 @@ pub const MASQUE_SEEDS: &[&str] = &[
 /// listener on any port), while retrying a real gateway there is the escape
 /// from a carrier that degrades UDP/443 to this range specifically.
 pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
-    "162.159.199.1",
     "162.159.199.2",
     "162.159.198.2",
     "162.159.198.1",
+    "162.159.199.1",
 ];
 
 /// Alternate UDP ports a verified gateway was measured serving connect-ip on.
