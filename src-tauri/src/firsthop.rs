@@ -62,6 +62,17 @@ pub fn get() -> Option<String> {
 mod tests {
     use super::*;
 
+    // >>> AETHER-APP-FIX shared-static-tests-must-not-race
+    // Rust 的测试默认多线程并行跑，而 `HOP` 是全进程共享的静态。四个测试并发
+    // 读写它就会互相踩：CI 上 `a_line_without_a_port_is_not_an_endpoint` 在
+    // `fresh()` 断言 None 之后、自己的断言之前，读到了并行测试刚 ingest 进去的
+    // 边缘，`assert_eq!(get(), None)` 随即失败（268 过 1 挂，且逐次运行结果
+    // 不定 —— 典型的竞态形态）。这把锁把本模块的测试串行化；锁中毒时直接
+    // 拿回守卫（`into_inner`），因为 poisoned 只说明某个测试 panic 过，
+    // 串行化的目的本身不受影响。
+    static TEST_SERIALIZER: Mutex<()> = Mutex::new(());
+    // <<< AETHER-APP-FIX shared-static-tests-must-not-race
+
     fn fresh() {
         reset();
         assert_eq!(get(), None);
@@ -69,6 +80,7 @@ mod tests {
 
     #[test]
     fn takes_the_warp_edge_from_the_engine_line() {
+        let _serial = TEST_SERIALIZER.lock().unwrap_or_else(|e| e.into_inner());
         fresh();
         ingest(
             "1789627203863 D/engine: [2026-09-17T06:40:03.863Z INFO  aether] \
@@ -79,6 +91,7 @@ mod tests {
 
     #[test]
     fn takes_the_bridge_from_the_tor_line() {
+        let _serial = TEST_SERIALIZER.lock().unwrap_or_else(|e| e.into_inner());
         fresh();
         ingest("[+] tor first hop: 212.83.43.74:80 via obfs4");
         assert_eq!(get().as_deref(), Some("212.83.43.74:80"));
@@ -87,6 +100,7 @@ mod tests {
     /// سطرِ بی‌ربط چیزی را عوض نمی‌کند — و مهم‌تر، سطرِ نزدیک‌ولی‌بی‌پورت هم نه.
     #[test]
     fn a_line_without_a_port_is_not_an_endpoint() {
+        let _serial = TEST_SERIALIZER.lock().unwrap_or_else(|e| e.into_inner());
         fresh();
         ingest("[tor] new bridge descriptor 'torfnase' (fresh): $3956… at 212.83.43.74");
         ingest("[+] socks5 server listening on 127.0.0.1:1819");
@@ -96,6 +110,7 @@ mod tests {
     /// نشستِ بعدی نشانیِ نشستِ قبلی را به ارث نمی‌برد.
     #[test]
     fn reset_forgets_the_previous_session() {
+        let _serial = TEST_SERIALIZER.lock().unwrap_or_else(|e| e.into_inner());
         fresh();
         ingest("[+] using cloudflare edge 162.159.192.163:859");
         assert!(get().is_some());
