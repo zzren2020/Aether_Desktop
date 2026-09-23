@@ -459,12 +459,14 @@ fn sniff_and_seed(
     let Some(ipv4) = Ipv4Packet::new_checked(pkt).ok() else {
         return; // IPv6 is not captured (routes are v4-only); fragments and non-IP are ignored.
     };
-    match ipv4.protocol() {
+    // smoltcp 0.12: the IPv4 protocol field getter is `next_header()`.
+    match ipv4.next_header() {
         smoltcp::wire::IpProtocol::Tcp => {
             let Ok(tcp) = TcpPacket::new_checked(ipv4.payload()) else {
                 return;
             };
-            let is_syn = tcp.syn_flag() && !tcp.ack_flag();
+            // smoltcp 0.12: flag getters are `syn()` / `ack()`.
+            let is_syn = tcp.syn() && !tcp.ack();
             if !is_syn {
                 return;
             }
