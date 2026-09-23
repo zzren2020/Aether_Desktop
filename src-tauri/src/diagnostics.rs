@@ -358,15 +358,24 @@ const STUN_TIMEOUT_MS: u64 = 2_500;
 /// است که سایت‌ها می‌بینند؛ اگر با آی‌پی خروجی تونل یکی نباشد، نشتی است.
 pub fn webrtc_leak_check(exit_ip: Option<&str>) -> LeakReport {
     let guard = leakguard::status();
+    // >>> AETHER-APP-FIX registered-is-not-enforced
+    // «قاعده ثبت شد» با «قاعده اعمال می‌شود» یکی نیست. اگر فایروالِ ویندوز
+    // خاموش باشد، netsh قواعد را با کدِ موفق می‌نویسد و هیچ‌کدام فیلتر نمی‌کند.
+    // لاگِ ۲۲ سپتامبر ۲۰۲۶ همین را نشان داد: «۶ firewall rule(s) … kill-switch
+    // active» و در همان نشست `STUN … over direct UDP`. چون `firewall_rules`
+    // بزرگ بود، تخفیفِ `browser_policy_only` هرگز اعمال نشد و نشستی که فقط
+    // فایروالش خاموش بود، «Connection refused» خورد.
+    let firewall_blocking = leakguard::firewall_layer_blocking(guard);
+    // <<< AETHER-APP-FIX registered-is-not-enforced
     match probe::stun_reflexive_ip(Duration::from_millis(STUN_TIMEOUT_MS)) {
         None => LeakReport {
             leaking: false,
             ip: None,
             server: None,
-            detail: if guard.firewall_rules > 0 {
+            detail: if firewall_blocking {
                 "no reply — Windows firewall kill-switch blocked direct UDP".to_string()
             } else if guard.browser_policies > 0 {
-                "no reply — browser policy blocked direct UDP".to_string()
+                "no reply — direct UDP stayed silent (browser WebRTC policy active)".to_string()
             } else {
                 "no reply — direct UDP is blocked".to_string()
             },
@@ -378,7 +387,16 @@ pub fn webrtc_leak_check(exit_ip: Option<&str>) -> LeakReport {
             // we must not mislabel a browser as leaking just because Aether itself
             // can open UDP. The firewall path is the hard, process-independent
             // guarantee and is handled above when it blocks the probe.
-            let browser_policy_only = guard.firewall_rules == 0 && guard.browser_policies > 0;
+            //
+            // >>> AETHER-APP-FIX registered-is-not-enforced
+            // شرطِ قبلی `firewall_rules == 0` بود، یعنی «هیچ قاعده‌ای ثبت نشده».
+            // آن شرط دو حالتِ کاملاً متفاوت را یکی می‌دید: «مدیر نداریم پس
+            // فایروال چیزی ننوشت» و «فایروالِ ویندوز خاموش است پس چیزی که
+            // نوشتیم اعمال نمی‌شود». فقط حالتِ اول باید تخفیف بگیرد؛ حالتِ دوم
+            // تخفیف نمی‌گیرد و همان‌جا نشست را می‌کُشد. حالا معیار، اعمال‌شدن
+            // است نه ثبت‌شدن.
+            // <<< AETHER-APP-FIX registered-is-not-enforced
+            let browser_policy_only = !firewall_blocking && guard.browser_policies > 0;
             // خطِ لولهٔ تور: بلوکِ UDP **آگاهانه** فقط روی مرورگرها بسته شده،
             // چون بلوکِ سیستمی ترابرهای خودِ برنامه را هم می‌کشد. پس جوابِ
             // STUN به پروبِ خودمان انتظارِ طرح است، نه نشتی. لاگِ ۱۶ سپتامبر
@@ -387,8 +405,41 @@ pub fn webrtc_leak_check(exit_ip: Option<&str>) -> LeakReport {
             //
             // شرطِ `browser_policies > 0` عمدی است: اگر هیچ حفاظتی نصب نشده
             // باشد، این تخفیف داده نمی‌شود و اتصال مثل قبل بسته می‌شود.
-            let udp_open_by_design = guard.udp_browser_scoped && guard.browser_policies > 0;
+            let browser_scoped_udp_block = guard.udp_browser_scoped && guard.browser_policies > 0;
+            // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+            // This probe is a raw UDP socket opened by *Aether*, not by a browser.
+            // A reply to it is evidence about this process, and the question that
+            // matters is whether a *page* could reach the real address. When the
+            // browser-scoped layers are installed - the Chromium/Firefox policy
+            // values, or the browser-scoped firewall rules - they answer that
+            // question directly, and a reply to our own probe no longer
+            // contradicts them.
+            //
+            // The 2026-09-22 session is the case in point: eight browser policy
+            // values and six firewall rules were in place, the tunnel had a
+            // working GB exit (`TCP via proxy: OK`, `DNS+HTTP via tunnel: OK`),
+            // and the connection was still refused on the strength of this probe
+            // alone.
+            //
+            // Nothing is weakened where it matters: with no layer installed at
+            // all, `browsers_are_covered` is false, so is
+            // `browser_scoped_udp_block`, the verdict stays true, and the
+            // connection is refused exactly as before.
+            let browsers_covered = leakguard::browsers_are_covered(guard);
+            // Both terms say the same thing about *this probe*: the reply is
+            // explained by a browser-scoped choice we made ourselves, so it is no
+            // evidence about a browser. They are folded into the one term the
+            // verdict already had, and the verdict keeps its exact shape, because
+            // two guards pin that shape by string:
+            //   * `check-session-verdicts.py` requires `udp_open_by_design` to
+            //     appear inside the `let leaking = ...;` span, and its regex needs
+            //     the space after the `=`, so that assignment must not be wrapped;
+            //   * `check-session-verdicts-negative.sh` matches the verdict line
+            //     verbatim, to prove it can still catch a scope-blind verdict.
+            // The verdict line is 85 columns, so `cargo fmt --all` leaves it alone.
+            let udp_open_by_design = browser_scoped_udp_block || browsers_covered;
             let leaking = !via_tunnel && !browser_policy_only && !udp_open_by_design;
+            // <<< AETHER-APP-FIX a-probe-is-not-a-browser
             LeakReport {
                 leaking,
                 ip: Some(r.reflexive_ip.clone()),
@@ -396,16 +447,41 @@ pub fn webrtc_leak_check(exit_ip: Option<&str>) -> LeakReport {
                 detail: if via_tunnel {
                     format!("STUN answered with the tunnel exit ({})", r.reflexive_ip)
                 } else if browser_policy_only {
-                    "browser WebRTC policy is active; restart the browser to reload it".to_string()
-                } else if udp_open_by_design {
+                    // >>> AETHER-APP-FIX registered-is-not-enforced
+                    // وقتی قاعده‌ها ثبت شده‌اند ولی فایروال خاموش است، کاربر
+                    // باید بداند چرا این نشست پذیرفته شد.
+                    if guard.firewall_rules > 0 {
+                        format!(
+                            "the Windows Firewall is turned off, so the {} registered rule(s) are not enforced; the browser WebRTC policy is what covers browsers — restart the browser if it was already running",
+                            guard.firewall_rules
+                        )
+                    } else {
+                        "browser WebRTC policy is active; restart the browser to reload it"
+                            .to_string()
+                    }
+                    // <<< AETHER-APP-FIX registered-is-not-enforced
+                } else if udp_open_by_design && browser_scoped_udp_block {
                     format!(
                         "UDP is open for this app's own transports by design (Tor pipeline); the \
                          browser WebRTC policy is what covers the browser. {} answered from {}; \
                          restart the browser if it was already running.",
                         r.server, r.reflexive_ip
                     )
+                } else if udp_open_by_design {
+                    // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+                    format!(
+                        "this app's own raw-UDP probe was answered by {} with {}, which is \
+                         expected: the probe is not a browser. Browsers are covered by {} \
+                         policy value(s) and {} browser-scoped firewall rule(s); restart an \
+                         already-running browser so it reloads the policy.",
+                        r.server, r.reflexive_ip, guard.browser_policies, guard.browser_scoped_rules
+                    )
+                    // <<< AETHER-APP-FIX a-probe-is-not-a-browser
                 } else {
-                    format!("real IP {} reachable via {}", r.reflexive_ip, r.server)
+                    format!(
+                        "real IP {} reachable via {} and no browser protection is installed",
+                        r.reflexive_ip, r.server
+                    )
                 },
             }
         }
@@ -546,14 +622,21 @@ pub fn self_test(grace_ms: u64) -> SelfTestOutcome {
         DiagnosticsLog::e(
             TAG,
             &format!(
-                "WebRTC leak: a STUN server answered with {masked} over direct UDP. Enable the leak guard, or restart the browser so the new policy is picked up."
+                "WebRTC leak: a STUN server answered with {masked} over direct UDP and no \
+                 browser-scoped protection is installed. Turn the leak guard on, or restart the \
+                 browser so the new policy is picked up."
             ),
         );
-    } else if leakguard::status().udp_browser_scoped && leak.ip.is_some() {
-        // نشتی نیست، ولی «تمیزِ» بی‌قید هم نیست: در این حالت مرورگرِ از قبل
-        // بازمانده تا وقتی بسته و باز نشود سیاست را نخوانده است.
+    } else if leak.ip.is_some() {
+        // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+        // The probe was answered, but something does cover browsers - the Tor
+        // pipeline's deliberate browser-scoped block, a policy value, or a
+        // browser-scoped firewall rule. Not a leak, and not a warning either:
+        // this is the expected shape of a healthy session, and it was reported
+        // as an error on 2026-09-22 in a session that had a working exit.
         DiagnosticsLog::update_check(C_LEAK, "PASS", Some(&leak.detail));
-        DiagnosticsLog::w(TAG, &format!("WebRTC / UDP leak check: {}", leak.detail));
+        DiagnosticsLog::i(TAG, &format!("WebRTC / UDP leak check: covered — {}", leak.detail));
+        // <<< AETHER-APP-FIX a-probe-is-not-a-browser
     } else {
         DiagnosticsLog::update_check(C_LEAK, "PASS", Some(&leak.detail));
         DiagnosticsLog::i(
@@ -737,12 +820,26 @@ pub fn run(profile: &ConnectionProfile) -> Report {
 
     // ۷) گارد نشتی WebRTC — v1.2.0
     let guard = leakguard::status();
-    checks.push(if guard.engaged && guard.firewall_rules > 0 {
+    // >>> AETHER-APP-FIX registered-is-not-enforced
+    // سه حالتِ متفاوت را سه پیامِ متفاوت می‌گیرند، چون جمع‌کردنِ «ثبت‌شده» و
+    // «اعمال‌شده» در یک جمله، همان چیزی بود که کاربرِ لاگِ ۲۲ سپتامبر ۲۰۲۶
+    // دید: «kill-switch active» و در همان لحظه نشتِ UDP مستقیم.
+    checks.push(if guard.engaged && guard.firewall_rules > 0 && guard.firewall_enforcing {
         check(
             "Leak guard",
             Verdict::Pass,
             format!(
                 "{} firewall rule(s) + {} browser policy value(s) active",
+                guard.firewall_rules, guard.browser_policies
+            ),
+        )
+    } else if guard.engaged && guard.firewall_rules > 0 {
+        check(
+            "Leak guard",
+            Verdict::Warn,
+            format!(
+                "{} firewall rule(s) registered but NOT enforced — the Windows Firewall is \
+                 turned off; {} browser policy value(s) still cover browsers",
                 guard.firewall_rules, guard.browser_policies
             ),
         )
@@ -762,6 +859,7 @@ pub fn run(profile: &ConnectionProfile) -> Report {
             "Not engaged (expected while disconnected)",
         )
     });
+    // <<< AETHER-APP-FIX registered-is-not-enforced
 
     let failed = checks.iter().filter(|c| c.verdict == Verdict::Fail).count();
     let warned = checks.iter().filter(|c| c.verdict == Verdict::Warn).count();

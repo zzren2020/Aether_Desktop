@@ -101,12 +101,36 @@ const FIREFOX_PREF_NAME: &str = "media.peerconnection.ice.proxy_only";
 /// که خود کاربر یا سازمانش تنظیم کرده دست نمی‌زند.
 const SENTINEL_NAME: &str = "AetherLeakGuardManaged";
 
+/// پروفایل‌های فایروال ویندوز و کلیدِ روشن/خاموشِ هرکدام.
+///
+/// از رجیستری خوانده می‌شود و نه از متنِ خروجیِ `netsh advfirewall show
+/// allprofiles state`: آن متن ترجمه می‌شود («State ON» در انگلیسی، «状态 启用»
+/// در چینی) و هر تطبیقِ رشته‌ای روی آن، داوریِ امنیتی را به زبانِ سیستم وابسته
+/// می‌کرد.
+const FIREWALL_PROFILE_KEYS: [&str; 3] = [
+    r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\DomainProfile",
+    r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\StandardProfile",
+    r"HKLM\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\PublicProfile",
+];
+const FIREWALL_ENABLE_VALUE: &str = "EnableFirewall";
+
 /// وضعیت زندهٔ گارد — پنل عیب‌یابی از همین می‌خواند.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GuardStatus {
     pub engaged: bool,
-    /// تعداد قواعد فایروالی که واقعاً نصب شدند (۰ = بدون دسترسی مدیر).
+    /// تعداد قواعد فایروالی که با کدِ موفق **ثبت** شدند (۰ = بدون دسترسی مدیر).
+    ///
+    /// این عدد فقط می‌گوید netsh قبول کرد. برای «حفاظت» باید
+    /// `firewall_enforcing` هم «بله» باشد؛ وگرنه قاعده‌ای ثبت شده که هیچ
+    /// بسته‌ای را نمی‌گیرد.
     pub firewall_rules: u32,
+    /// آیا فایروال ویندوز واقعاً این قواعد را اعمال می‌کند؟
+    ///
+    /// اگر پروفایلِ فایروال «خاموش» باشد، netsh همان قاعده را با کدِ موفق در
+    /// مخزنِ خط‌مشی می‌نویسد ولی فیلتری وجود ندارد. این تفاوت را داوریِ نشتی
+    /// باید بداند، وگرنه نشستی را رد می‌کند که تنها مشکلش خاموش‌بودنِ فایروالِ
+    /// ویندوز است — همان چیزی که در لاگِ ۲۲ سپتامبر ۲۰۲۶ افتاد.
+    pub firewall_enforcing: bool,
     /// تعداد سیاست‌های مرورگر که نوشته شدند.
     pub browser_policies: u32,
     /// آیا بلوکِ UDP فقط به مرورگرها بسته شده است؟
@@ -117,6 +141,16 @@ pub struct GuardStatus {
     /// برای **فرآیندهای خودمان** انتظارِ طرح است، نه نشتی — و داوریِ نشتی
     /// باید همین را بداند، وگرنه نشستی را رد می‌کند که خودش این‌طور خواسته.
     pub udp_browser_scoped: bool,
+    /// >>> AETHER-APP-FIX a-probe-is-not-a-browser
+    /// تعداد قواعدی که **به خودِ مرورگرها** بسته شده‌اند (۲.۱ و کلیدِ قطعِ
+    /// مرورگرمحور).
+    ///
+    /// این عدد چیزی را می‌گوید که `firewall_rules` نمی‌گوید: «مرورگرها پوشش
+    /// دارند». داوریِ نشتی به آن نیاز دارد تا «پروبِ خامِ خودِ ما جواب گرفت»
+    /// را از «مرورگر می‌تواند نشتی کند» جدا کند. لاگِ ۲۲ سپتامبر ۲۰۲۶ دقیقاً
+    /// همین دو را یکی گرفته بود.
+    pub browser_scoped_rules: u32,
+    // <<< AETHER-APP-FIX a-probe-is-not-a-browser
 }
 
 fn status_cell() -> &'static parking_lot::Mutex<GuardStatus> {
@@ -128,6 +162,85 @@ fn status_cell() -> &'static parking_lot::Mutex<GuardStatus> {
 pub fn status() -> GuardStatus {
     *status_cell().lock()
 }
+
+/// آیا فایروالِ ویندوز واقعاً فیلتر می‌کند؟
+///
+/// `netsh advfirewall firewall add rule` وقتی پروفایلِ فایروال خاموش است هم با
+/// کدِ موفق برمی‌گردد: قاعده در مخزنِ خط‌مشی نوشته می‌شود و هیچ بسته‌ای فیلتر
+/// نمی‌شود. پس «تعدادِ قاعده» هرگز مدرکِ حفاظت نیست تا وقتی این تابع «بله»
+/// بگوید.
+///
+/// محافظه‌کارانه است: فقط وقتی «بله» می‌گوید که **هر** پروفایلِ خوانده‌شده
+/// روشن باشد، چون قواعدِ ما با `profile=any` نصب می‌شوند و ادعای ضمانتِ
+/// سیستم‌گسترده با یک پروفایلِ خاموش، ادعای بی‌پشتوانه است. اگر هیچ پروفایلی
+/// خوانده نشد (رجیستریِ غیرمنتظره) پاسخ «خیر» است — دوباره، سمتِ امن.
+pub fn firewall_enforcing() -> bool {
+    let mut readable = 0u32;
+    for key in FIREWALL_PROFILE_KEYS {
+        let value = match reg_read(key, FIREWALL_ENABLE_VALUE) {
+            Some(v) => v,
+            None => continue,
+        };
+        readable += 1;
+        if !reg_dword_is_on(&value) {
+            return false;
+        }
+    }
+    readable > 0
+}
+
+/// مقدارِ REG_DWORD را به روشن/خاموش تبدیل می‌کند. `reg query` عدد را
+/// هگزادسیمال می‌دهد (`0x1`) و ممکن است در برخی بیلدها اعشاری بیاید.
+fn reg_dword_is_on(value: &str) -> bool {
+    let v = value.trim().to_ascii_lowercase();
+    matches!(v.as_str(), "0x1" | "1" | "true")
+}
+
+/// آیا لایهٔ فایروالِ گارد **واقعاً** دارد جلوی UDP را می‌گیرد؟
+///
+/// یک جای واحد برای این پرسش، تا داوریِ نشتی و پنلِ عیب‌یابی یک جواب بگیرند و
+/// هیچ‌کدام «ثبت‌شده» را با «اعمال‌شده» عوض نکنند.
+pub fn firewall_layer_blocking(status: GuardStatus) -> bool {
+    status.firewall_rules > 0 && status.firewall_enforcing
+}
+
+// >>> AETHER-APP-FIX a-probe-is-not-a-browser
+/// Does anything installed actually cover **browsers** - the only vector WebRTC
+/// leaks through?
+///
+/// ## Why the leak verdict needs this, and not just the firewall
+///
+/// The leak probe is a raw UDP socket opened by Aether itself. It is not a
+/// browser, so a reply to it says something about Aether's own process and
+/// nothing about whether a page could reach the user's real address. Two layers
+/// do cover browsers, and neither needs administrator rights or a running
+/// Windows Firewall:
+///
+/// * the Chromium policy `WebRtcIPHandlingPolicy=disable_non_proxied_udp` and
+///   the Firefox pref `media.peerconnection.ice.proxy_only`, both written under
+///   `HKCU`, and
+/// * the browser-scoped firewall rules ([`GuardStatus::browser_scoped_rules`]).
+///
+/// The 2026-09-22 session installed eight policy values and four browser-scoped
+/// rules, and was still refused on the strength of its own probe answering:
+///
+/// ```text
+///   I/leakguard: Leak guard engaged - 6 firewall rule(s), 8 browser policy value(s)
+///   I/diag: DNS+HTTP via tunnel: OK - exit 198.244.179.xxx GB (2040 ms)
+///   E/diag: WebRTC leak: a STUN server answered with 58.48.5.xxx over direct UDP
+///   E/state: Connection refused: WebRTC can still reach the real IP over direct UDP
+/// ```
+///
+/// That was a working tunnel - a GB exit reached over a chained MASQUE+Psiphon
+/// pipeline - thrown away over a measurement of the wrong process.
+///
+/// The verdict therefore stays fail-closed where it matters: with *nothing*
+/// installed, the probe answering still means a browser could leak, and the
+/// connection is still refused.
+pub fn browsers_are_covered(status: GuardStatus) -> bool {
+    status.browser_policies > 0 || status.browser_scoped_rules > 0
+}
+// <<< AETHER-APP-FIX a-probe-is-not-a-browser
 
 /// یک تغییر برگشت‌پذیر در رجیستری.
 #[derive(Debug, Clone)]
@@ -143,8 +256,16 @@ struct PolicyEdit {
 pub struct LeakGuard {
     rules: u32,
     kill_rules: u32,
+    /// >>> AETHER-APP-FIX a-probe-is-not-a-browser
+    /// Subset of `rules + kill_rules` that is scoped to browser executables.
+    /// See [`GuardStatus::browser_scoped_rules`].
+    browser_scoped_rules: u32,
+    // <<< AETHER-APP-FIX a-probe-is-not-a-browser
     /// ببینید `GuardStatus::udp_browser_scoped`.
     udp_browser_scoped: bool,
+    /// ببینید `GuardStatus::firewall_enforcing`. یک بار در `engage` خوانده
+    /// می‌شود تا هر `status()` یک فرآیندِ `reg.exe` تازه باز نکند.
+    enforcing: bool,
     /// Policies already correct count as active even when this session did not write them.
     policies: u32,
     edits: Vec<PolicyEdit>,
@@ -173,12 +294,23 @@ impl LeakGuard {
         me.apply_browser_policies();
         me.apply_firewall(profile);
         me.apply_kill_switch(profile);
+        // >>> AETHER-APP-FIX registered-is-not-enforced
+        // قاعده‌ای که netsh ثبت کرده با قاعده‌ای که فایروال اعمال می‌کند یکی
+        // نیست. اگر پروفایلِ فایروال خاموش باشد، `me.rules` عددی بزرگ است و
+        // اثرش صفر. یک بار اینجا خوانده می‌شود و در `GuardStatus` می‌نشیند تا
+        // داوریِ نشتی بتواند «ثبت‌شده» را از «اعمال‌شده» جدا کند.
+        me.enforcing = firewall_enforcing();
+        // <<< AETHER-APP-FIX registered-is-not-enforced
 
         *status_cell().lock() = GuardStatus {
             engaged: true,
             firewall_rules: me.rules + me.kill_rules,
+            firewall_enforcing: me.enforcing,
             browser_policies: me.policies,
             udp_browser_scoped: me.udp_browser_scoped,
+            // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+            browser_scoped_rules: me.browser_scoped_rules,
+            // <<< AETHER-APP-FIX a-probe-is-not-a-browser
         };
 
         if me.rules == 0 {
@@ -193,8 +325,26 @@ impl LeakGuard {
                     "Firewall layer not installed (administrator rights required) — browser policy protection is active for newly started browsers.",
                 );
             }
+        } else if !me.enforcing {
+            // >>> AETHER-APP-FIX registered-is-not-enforced
+            // لاگِ ۲۲ سپتامبر ۲۰۲۶: «۶ firewall rule(s) … system-wide UDP
+            // kill-switch active» و بلافاصله `WebRTC leak: a STUN server
+            // answered with … over direct UDP`. هر دو درست بودند و همدیگر را
+            // نقض می‌کردند، چون پروفایلِ فایروال ویندوز روی آن ماشین خاموش
+            // بود: قواعد ثبت شده بودند و هیچ‌کدام اعمال نمی‌شد. پیامِ قبلی
+            // «فعال» می‌گفت و همین ادعا، نشستِ سالم را رد می‌کرد.
+            DiagnosticsLog::w(
+                TAG,
+                &format!(
+                    "{} firewall rule(s) registered, but the Windows Firewall is turned off on this machine, so none of them is enforced: the UDP kill-switch and the STUN/TURN blocks are inert. The {} browser policy value(s) still cover browsers. Turn the Windows Firewall on to get the system-wide layer back.",
+                    me.rules, me.policies
+                ),
+            );
+            // <<< AETHER-APP-FIX registered-is-not-enforced
         }
-        let protection = if me.rules > 0 && needs_pluggable_transport_egress(profile) {
+        let protection = if me.rules > 0 && !me.enforcing {
+            "registered but NOT enforced — the Windows Firewall is off"
+        } else if me.rules > 0 && needs_pluggable_transport_egress(profile) {
             "browser-scoped UDP kill-switch active (Tor pipeline)"
         } else if me.rules > 0 {
             "system-wide UDP kill-switch active"
@@ -302,6 +452,9 @@ impl LeakGuard {
             );
             if ok {
                 self.rules += 1;
+                // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+                self.browser_scoped_rules += 1;
+                // <<< AETHER-APP-FIX a-probe-is-not-a-browser
             }
         }
 
@@ -323,6 +476,9 @@ impl LeakGuard {
                     let program = exe.to_string_lossy().to_string();
                     if fw_add(&args, Some(&program)) {
                         self.rules += 1;
+                        // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+                        self.browser_scoped_rules += 1;
+                        // <<< AETHER-APP-FIX a-probe-is-not-a-browser
                     }
                 }
             } else if fw_add(&args, None) {
@@ -347,6 +503,9 @@ impl LeakGuard {
                     let program = exe.to_string_lossy().to_string();
                     if fw_add(&args, Some(&program)) {
                         self.rules += 1;
+                        // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+                        self.browser_scoped_rules += 1;
+                        // <<< AETHER-APP-FIX a-probe-is-not-a-browser
                     }
                 }
             } else if fw_add(&args, None) {
@@ -378,6 +537,11 @@ impl LeakGuard {
                 Some(&program),
             ) {
                 self.kill_rules += 1;
+                // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+                // This is the strongest browser-scoped guarantee there is: while
+                // Aether holds the tunnel, a browser can only reach localhost.
+                self.browser_scoped_rules += 1;
+                // <<< AETHER-APP-FIX a-probe-is-not-a-browser
             }
         }
         // IPv6 protection is process-independent: block global IPv6 on the
@@ -403,6 +567,9 @@ impl LeakGuard {
                     let program = exe.to_string_lossy().to_string();
                     if fw_add_named(KILL_RULE, &args, Some(&program)) {
                         self.kill_rules += 1;
+                        // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+                        self.browser_scoped_rules += 1;
+                        // <<< AETHER-APP-FIX a-probe-is-not-a-browser
                     }
                 }
             } else if fw_add_named(KILL_RULE, &args, None) {
@@ -419,6 +586,9 @@ impl LeakGuard {
         self.rules = 0;
         self.kill_rules = 0;
         self.policies = 0;
+        // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+        self.browser_scoped_rules = 0;
+        // <<< AETHER-APP-FIX a-probe-is-not-a-browser
         self.edits.clear();
     }
 
@@ -434,8 +604,15 @@ impl LeakGuard {
         *status_cell().lock() = GuardStatus {
             engaged: self.kill_rules > 0,
             firewall_rules: self.kill_rules,
+            firewall_enforcing: self.enforcing,
             browser_policies: 0,
             udp_browser_scoped: self.udp_browser_scoped,
+            // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+            // The kill rules themselves survive the reconnect, and the
+            // browser-scoped ones among them are exactly the coverage the leak
+            // verdict has to keep seeing.
+            browser_scoped_rules: self.browser_scoped_rules,
+            // <<< AETHER-APP-FIX a-probe-is-not-a-browser
         };
     }
 
@@ -758,6 +935,123 @@ mod tests {
         assert_eq!(g.policies, 0);
         assert!(g.edits.is_empty());
     }
+
+    // >>> AETHER-APP-FIX registered-is-not-enforced
+    /// `reg query` مقدار را هگزادسیمال می‌دهد؛ خواندنِ آن با مقایسهٔ رشته‌ایِ
+    /// ساده («1») هر بار «خاموش» می‌گرفت و کلِ لایهٔ فایروال را بی‌اثر می‌کرد.
+    #[test]
+    fn enable_firewall_is_read_as_a_dword() {
+        assert!(reg_dword_is_on("0x1"));
+        assert!(reg_dword_is_on("  0x1\r"));
+        assert!(reg_dword_is_on("1"));
+        assert!(!reg_dword_is_on("0x0"));
+        assert!(!reg_dword_is_on("0"));
+    }
+
+    /// رگرسیونِ لاگِ ۲۲ سپتامبر ۲۰۲۶.
+    ///
+    /// `netsh advfirewall firewall add rule` وقتی پروفایلِ فایروال خاموش است هم
+    /// با کدِ موفق برمی‌گردد، پس `firewall_rules` بزرگ می‌شود و قاعده‌ها هیچ
+    /// بسته‌ای را نمی‌گیرند. اگر داوریِ نشتی «تعدادِ قاعده» را مدرکِ حفاظت
+    /// بگیرد، نشستی که تنها مشکلش فایروالِ خاموشِ ویندوز است با
+    /// «Connection refused» رد می‌شود — همان چیزی که در آن لاگ افتاد.
+    #[test]
+    fn rules_registered_while_the_firewall_is_off_are_not_protection() {
+        let off = GuardStatus {
+            engaged: true,
+            firewall_rules: 6,
+            firewall_enforcing: false,
+            browser_policies: 8,
+            udp_browser_scoped: false,
+            // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+            // The 2026-09-22 session: three browsers were found and the
+            // browser-scoped layer was installed even though the firewall was
+            // off and could not enforce the system-wide one.
+            browser_scoped_rules: 4,
+            // <<< AETHER-APP-FIX a-probe-is-not-a-browser
+        };
+        assert!(
+            !firewall_layer_blocking(off),
+            "قاعدهٔ ثبت‌شده در فایروالِ خاموش، مدرکِ حفاظت نیست"
+        );
+
+        // همان شمارش، این بار با فایروالِ روشن — حالا ضمانت واقعی است.
+        let on = GuardStatus {
+            firewall_enforcing: true,
+            ..off
+        };
+        assert!(firewall_layer_blocking(on));
+
+        // بدون دسترسی مدیر هیچ قاعده‌ای ثبت نشده — نه حفاظتی، نه ادعایی.
+        let no_admin = GuardStatus {
+            firewall_rules: 0,
+            firewall_enforcing: false,
+            ..off
+        };
+        assert!(!firewall_layer_blocking(no_admin));
+    }
+    // <<< AETHER-APP-FIX registered-is-not-enforced
+
+    // >>> AETHER-APP-FIX a-probe-is-not-a-browser
+    /// The distinction the leak verdict turns on: "our own probe got an answer"
+    /// versus "a browser could leak".
+    ///
+    /// The exact shape of the 2026-09-22 session - eight policy values, four
+    /// browser-scoped rules, Windows Firewall off - must read as *covered*, and
+    /// a session with nothing installed at all must still read as uncovered so
+    /// that the verdict stays fail-closed.
+    #[test]
+    fn browsers_are_covered_by_policies_or_by_browser_scoped_rules() {
+        let nothing = GuardStatus::default();
+        assert!(
+            !browsers_are_covered(nothing),
+            "with nothing installed the verdict must stay fail-closed"
+        );
+
+        // Policies alone, with no administrator rights at all.
+        let policies_only = GuardStatus {
+            browser_policies: 8,
+            ..nothing
+        };
+        assert!(browsers_are_covered(policies_only));
+
+        // Browser-scoped rules alone, with the firewall registering but inert.
+        let rules_only = GuardStatus {
+            firewall_rules: 6,
+            firewall_enforcing: false,
+            browser_scoped_rules: 4,
+            ..nothing
+        };
+        assert!(browsers_are_covered(rules_only));
+
+        // The whole 2026-09-22 picture.
+        let the_session = GuardStatus {
+            engaged: true,
+            firewall_rules: 6,
+            firewall_enforcing: false,
+            browser_policies: 8,
+            udp_browser_scoped: false,
+            browser_scoped_rules: 4,
+        };
+        assert!(browsers_are_covered(the_session));
+        assert!(!firewall_layer_blocking(the_session));
+    }
+
+    /// A system-wide rule is not browser coverage, and must not be mistaken for
+    /// it: `firewall_rules` counts both layers together.
+    #[test]
+    fn a_system_wide_rule_alone_is_not_browser_coverage() {
+        let system_wide_only = GuardStatus {
+            engaged: true,
+            firewall_rules: 6,
+            firewall_enforcing: false,
+            browser_policies: 0,
+            udp_browser_scoped: false,
+            browser_scoped_rules: 0,
+        };
+        assert!(!browsers_are_covered(system_wide_only));
+    }
+    // <<< AETHER-APP-FIX a-probe-is-not-a-browser
 
     // >>> AETHER-APP-FIX pt-egress-not-blocked
     /// این تست همان چیزی را می‌بندد که لاگ ۲۰۲۶-۰۹-۱۶ نشان داد: تور روی ۰–۱۵٪
