@@ -50,6 +50,8 @@
 
 use crate::log::DiagnosticsLog;
 use anyhow::{anyhow, Context, Result};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
@@ -70,6 +72,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 const TAG: &str = "tun_relay";
+
+// Hide the console window of every route.exe/netsh child: a GUI process
+// spawning console tools without this flag flashes a cmd window per call
+// (17 route adds on connect, 17 deletes on disconnect — user report 2026-09-23).
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Addresses this process talks to ABOUT the tunnel are all inside these
 /// networks: WireGuard endpoints (`wireguard::WG_PREFIXES_V4`) and MASQUE
@@ -114,9 +122,7 @@ impl RelayHandle {
         // Routes first: a torn-down adapter with live 0.0.0.0/1 routes is how
         // a machine loses its internet after a disconnect.
         for (dest, mask) in &self.routes_added {
-            let _ = std::process::Command::new("route")
-                .args(["delete", dest, "mask", mask])
-                .output();
+            route_delete(dest, mask);
         }
         DiagnosticsLog::i(TAG, "TUN data path removed — default routes released.");
         // The poll thread checks `stop` every tick; the Wintun read thread
@@ -138,16 +144,29 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
     let gateway = default_gateway().map_err(|e| anyhow!("no default gateway found: {e}"))?;
 
     let mut routes_added: Vec<(String, String)> = Vec::new();
-    for prefix in ENGINE_PREFIXES_V4 {
-        let (dest, mask) = prefix.split_once('/').expect("static prefix");
-        let mask = prefix_to_mask(mask.parse::<u8>().expect("static prefix len"));
-        route_add(dest, &mask, &gateway.to_string())?;
-        routes_added.push((dest.to_string(), mask));
-    }
-    let tun_gw = crate::tun::TUN_IPV4.to_string();
-    for dest in ["0.0.0.0", "128.0.0.0"] {
-        route_add(dest, "128.0.0.0", &tun_gw)?;
-        routes_added.push((dest.to_string(), "128.0.0.0".to_string()));
+    let install = |routes_added: &mut Vec<(String, String)>| -> Result<()> {
+        for prefix in ENGINE_PREFIXES_V4 {
+            let (dest, mask) = prefix.split_once('/').expect("static prefix");
+            let mask = prefix_to_mask(mask.parse::<u8>().expect("static prefix len"));
+            route_add_idempotent(dest, &mask, &gateway.to_string())?;
+            routes_added.push((dest.to_string(), mask));
+        }
+        let tun_gw = crate::tun::TUN_IPV4.to_string();
+        for dest in ["0.0.0.0", "128.0.0.0"] {
+            route_add_idempotent(dest, "128.0.0.0", &tun_gw)?;
+            routes_added.push((dest.to_string(), "128.0.0.0".to_string()));
+        }
+        Ok(())
+    };
+    if let Err(e) = install(&mut routes_added) {
+        // Never leave a partial route set behind: a stale 0.0.0.0/1 pointing
+        // at an adapter nobody drains is how a machine loses its internet
+        // (and a stale engine route is what made the next connect's route add
+        // fail with "object already exists" — log 6-2).
+        for (dest, mask) in &routes_added {
+            route_delete(dest, mask);
+        }
+        return Err(e);
     }
     DiagnosticsLog::i(
         TAG,
@@ -214,6 +233,7 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
 fn route_add(dest: &str, mask: &str, gateway: &str) -> Result<()> {
     let out = std::process::Command::new("route")
         .args(["add", dest, "mask", mask, gateway, "metric", "1"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("route add failed to execute")?;
     if !out.status.success() {
@@ -222,6 +242,24 @@ fn route_add(dest: &str, mask: &str, gateway: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Idempotent add: a route left over from an earlier session makes a plain
+/// `route add` fail with "the object already exists" (log 6-2). Remove the
+/// stale copy and try once more before giving up.
+fn route_add_idempotent(dest: &str, mask: &str, gateway: &str) -> Result<()> {
+    if route_add(dest, mask, gateway).is_ok() {
+        return Ok(());
+    }
+    route_delete(dest, mask);
+    route_add(dest, mask, gateway)
+}
+
+fn route_delete(dest: &str, mask: &str) {
+    let _ = std::process::Command::new("route")
+        .args(["delete", dest, "mask", mask])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 fn prefix_to_mask(bits: u8) -> String {
@@ -238,6 +276,7 @@ fn prefix_to_mask(bits: u8) -> String {
 fn default_gateway() -> Result<Ipv4Addr> {
     let out = std::process::Command::new("route")
         .args(["print", "0.0.0.0"])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .context("route print failed to execute")?;
     let text = String::from_utf8_lossy(&out.stdout);
@@ -501,6 +540,14 @@ fn sniff_and_seed(
             if udp_sessions.contains_key(&src_port) {
                 return;
             }
+            // NBNS (137), mDNS (5353), SSDP and friends are broadcast/multicast
+            // by nature — they must never leave the machine, and seeding a
+            // relay session for them only produces noise (log 6-3: dozens of
+            // idle sessions expiring).
+            let dst = ipv4.dst_addr();
+            if dst.is_broadcast() || dst.is_multicast() || dst.is_unspecified() {
+                return;
+            }
             let rx = UdpPacketBuffer::new(
                 vec![UdpPacketMetadata::EMPTY; 64],
                 vec![0u8; 65535],
@@ -700,61 +747,146 @@ fn spawn_udp_relay(
     std::thread::Builder::new()
         .name("tun-udp".into())
         .spawn(move || {
-            // One SOCKS5 UDP ASSOCIATE per application source port; the
-            // control connection doubles as the relay's lifetime.
-            let Ok((control, relay)) = socks5_udp_associate(socks_port_of(), src_port) else {
-                return;
-            };
-            let Ok(sock) = StdUdpSocket::bind("127.0.0.1:0") else {
-                return;
-            };
-            let _ = sock.connect(relay);
-            let mut expects_dns = false;
+            // DNS never touches UDP ASSOCIATE: the psiphon exit refuses
+            // CMD 0x03 outright ("command was 0x03, not 0x01" — log 6-1) and
+            // the masque pipeline's UDP egress is unreliable (log 6-3), so
+            // every :53 datagram is resolved over DNS-over-TCP on a plain
+            // SOCKS5 CONNECT instead — the one path every pipeline supports.
+            // Other UDP lazily establishes one ASSOCIATE per source port; if
+            // the exit has no UDP egress those datagrams are dropped (QUIC
+            // falls back to TCP) while DNS keeps working.
+            let mut associate: Option<(TcpStream, StdUdpSocket)> = None;
+            let mut refused_logged = false;
+            // Once the exit refused ASSOCIATE, stop retrying: a QUIC flow
+            // would otherwise dial SOCKS once per datagram.
+            let mut associate_dead = false;
             let mut buf = [0u8; 65535];
             loop {
                 // Application → tunnel.
                 match from_poll.recv_timeout(Duration::from_millis(250)) {
                     Ok((data, dst)) => {
                         if dst.port == 53 {
-                            expects_dns = true;
+                            // One short-lived thread per query; it only needs
+                            // a clone of the return channel.
+                            let to_poll = to_poll.clone();
+                            std::thread::Builder::new()
+                                .name("tun-dns".into())
+                                .spawn(move || {
+                                    if let Some(resp) = dns_over_tcp(&data, &dst) {
+                                        let _ = to_poll.send((resp, dst));
+                                    }
+                                })
+                                .ok();
+                            continue;
                         }
+                        if associate.is_none() {
+                            if !associate_dead {
+                                match establish_udp_associate(src_port) {
+                                    Ok(pair) => associate = Some(pair),
+                                    Err(_) => {
+                                        associate_dead = true;
+                                        if !refused_logged {
+                                            refused_logged = true;
+                                            DiagnosticsLog::w(
+                                                TAG,
+                                                "UDP ASSOCIATE refused by the exit SOCKS5 — this pipeline has no UDP egress; DNS still resolves over TCP and QUIC falls back to TCP.",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            if associate.is_none() {
+                                continue; // drop the datagram
+                            }
+                        }
+                        let (_, sock) = associate.as_ref().expect("established above");
                         let mut gram = Vec::with_capacity(data.len() + 10);
                         gram.extend_from_slice(&[0u8, 0, 0]); // RSV + FRAG
                         push_endpoint(&mut gram, &dst);
                         gram.extend_from_slice(&data);
                         if sock.send(&gram).is_err() {
-                            break;
+                            associate = None; // relay socket died; re-establish lazily
                         }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    Err(_) => break, // poll loop dropped the session
+                    Err(_) => return, // poll loop dropped the session
                 }
-                // Tunnel → application.
-                loop {
-                    match sock.recv(&mut buf) {
-                        Ok(n) => {
-                            let Some((src, payload)) = parse_socks_udp(&buf[..n]) else {
-                                continue;
-                            };
-                            let mut out = payload.to_vec();
-                            if expects_dns && src.port == 53 {
-                                strip_aaaa(&mut out);
+                // Tunnel → application (only meaningful with a live associate).
+                if associate.is_some() {
+                    let (control, sock) = associate.as_ref().expect("checked above");
+                    loop {
+                        match sock.recv(&mut buf) {
+                            Ok(n) => {
+                                let Some((src, payload)) = parse_socks_udp(&buf[..n]) else {
+                                    continue;
+                                };
+                                let mut out = payload.to_vec();
+                                if src.port == 53 {
+                                    strip_aaaa(&mut out);
+                                }
+                                if to_poll.send((out, src)).is_err() {
+                                    return;
+                                }
                             }
-                            if to_poll.send((out, src)).is_err() {
-                                return;
+                            Err(ref e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break
+                            }
+                            Err(_) => {
+                                associate = None;
+                                break;
                             }
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => return,
+                    }
+                    if let Some((control, _)) = associate.as_ref() {
+                        if !control_alive(control) {
+                            return;
+                        }
                     }
                 }
-                if !control_alive(&control) {
-                    break;
-                }
             }
-            let _ = control;
         })
         .ok();
+}
+
+/// Establish (control stream + relay socket) for non-DNS UDP, with the relay
+/// socket pre-connected and a short read timeout so the pump loop never wedges.
+fn establish_udp_associate(src_port: u16) -> std::io::Result<(TcpStream, StdUdpSocket)> {
+    let (control, relay) = socks5_udp_associate(socks_port_of(), src_port)?;
+    let sock = StdUdpSocket::bind("127.0.0.1:0")?;
+    sock.connect(relay)?;
+    sock.set_read_timeout(Some(Duration::from_millis(250)))?;
+    Ok((control, sock))
+}
+
+/// Resolve one DNS query over DNS-over-TCP (RFC 1035 §4.2.2: 2-byte length
+/// prefix) through a SOCKS5 CONNECT to the resolver — the transport every
+/// exit pipeline supports, unlike UDP ASSOCIATE.
+fn dns_over_tcp(query: &[u8], dst: &IpEndpoint) -> Option<Vec<u8>> {
+    if query.len() < 12 || query.len() > 4096 {
+        return None;
+    }
+    let mut stream = socks5_connect(socks_port_of(), *dst).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(4))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
+    let mut msg = Vec::with_capacity(query.len() + 2);
+    msg.extend_from_slice(&(query.len() as u16).to_be_bytes());
+    msg.extend_from_slice(query);
+    stream.write_all(&msg).ok()?;
+    let mut len_buf = [0u8; 2];
+    stream.read_exact(&mut len_buf).ok()?;
+    let len = u16::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        return None;
+    }
+    let mut resp = vec![0u8; len];
+    stream.read_exact(&mut resp).ok()?;
+    // The reply came back through the tunnel; strip AAAA here too so the
+    // application never sees an IPv6 answer it cannot use.
+    strip_aaaa(&mut resp);
+    Some(resp)
 }
 
 fn socks_port_of() -> u16 {
