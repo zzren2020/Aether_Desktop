@@ -23,8 +23,8 @@
 //!    machine), and — before that — host routes for every network the ENGINE
 //!    itself dials, so the engine's own packets never enter the adapter we
 //!    are feeding (no feedback loop).
-//! 2. A Wintun read thread blocks on `receive_packet` and pushes raw IP
-//!    packets into a queue.
+//! 2. A Wintun read thread drains `try_receive` (non-blocking, 1 ms idle
+//!    retry) and pushes raw IP packets into a queue.
 //! 3. A poll thread owns a smoltcp `Interface` (medium-ip, any-ip) plus the
 //!    `SocketSet`. Before each poll it peeks the queued packets and — for a
 //!    TCP SYN or the first datagram of a UDP source port — creates the
@@ -59,8 +59,7 @@ use smoltcp::socket::udp::{
 };
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
-    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, Ipv6Packet,
-    TcpPacket,
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, TcpPacket,
 };
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -169,13 +168,20 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
             .name("tun-read".into())
             .spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    match session.receive_packet() {
-                        Ok(packet) => {
+                    match session.try_receive() {
+                        Ok(Some(packet)) => {
                             let bytes = packet.bytes().to_vec();
                             drop(packet);
                             // A full queue means the poll loop is stuck; drop
                             // newest rather than wedging the ring buffer.
                             let _ = pkt_tx.send(bytes);
+                        }
+                        Ok(None) => {
+                            // Nothing right now: retry shortly so `stop` is
+                            // honored promptly (try_receive is non-blocking;
+                            // a blocking receive would wedge this thread until
+                            // the session closes).
+                            std::thread::sleep(Duration::from_millis(1));
                         }
                         Err(_) => break, // session closed by teardown
                     }
@@ -290,7 +296,7 @@ impl Device for RelayDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
-        caps.max_transmission_unit = self.mtu;
+        caps.max_transmission_unit = self.mtu as usize;
         caps
     }
 }
@@ -305,13 +311,22 @@ impl RxToken for RelayRxToken {
 }
 
 impl TxToken for RelayTxToken {
-    fn consume<V, F>(self, _timestamp: SmolInstant, len: usize, f: F) -> V
+    // smoltcp 0.12 signature: consume(self, len, f) — no timestamp parameter.
+    fn consume<R, F>(self, len: usize, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> V,
+        F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buf = vec![0u8; len];
-        let out = f(&mut buf);
-        let _ = self.session.send_packet(&buf);
+        let mut packet = match self.session.allocate_send_packet(len as u16) {
+            Ok(p) => p,
+            // Session is closing: build into a scratch buffer so `f` still
+            // sees a buffer of the promised size, and drop the frame.
+            Err(_) => {
+                let mut scratch = vec![0u8; len];
+                return f(&mut scratch);
+            }
+        };
+        let out = f(packet.bytes_mut());
+        self.session.send_packet(packet);
         out
     }
 }
@@ -353,7 +368,7 @@ fn poll_loop(
     stop: Arc<AtomicBool>,
 ) {
     let queue: SharedQueue = Arc::new(Mutex::new(VecDeque::new()));
-    let device = RelayDevice {
+    let mut device = RelayDevice {
         queue: queue.clone(),
         session,
         mtu,
@@ -493,10 +508,9 @@ fn sniff_and_seed(
                 vec![0u8; 65535],
             );
             let mut sock = UdpSocket::new(rx, tx);
-            if sock
-                .bind((Ipv4Address::UNSPECIFIED, src_port))
-                .is_err()
-            {
+            // From<u16> for IpListenEndpoint = "this local port, any address"
+            // — exactly the wildcard bind the source-port routing needs.
+            if sock.bind(src_port).is_err() {
                 return;
             }
             let handle = sockets.add(sock);
@@ -574,7 +588,7 @@ fn pump_tcp(
                 }
             }
             let chunk = entry.pending.front_mut().expect("checked above");
-            let n = sock.send_slice(chunk);
+            let n = sock.send_slice(chunk).unwrap_or(0);
             if n == chunk.len() {
                 entry.pending.pop_front();
             } else {
@@ -686,7 +700,7 @@ fn spawn_udp_relay(
         .spawn(move || {
             // One SOCKS5 UDP ASSOCIATE per application source port; the
             // control connection doubles as the relay's lifetime.
-            let Ok((mut control, relay)) = socks5_udp_associate(socks_port_of(), src_port) else {
+            let Ok((control, relay)) = socks5_udp_associate(socks_port_of(), src_port) else {
                 return;
             };
             let Ok(sock) = StdUdpSocket::bind("127.0.0.1:0") else {
@@ -747,13 +761,10 @@ fn socks_port_of() -> u16 {
 
 /// Push a SOCKS5 address (ATYP + ADDR + PORT) for an endpoint.
 fn push_endpoint(buf: &mut Vec<u8>, ep: &IpEndpoint) {
+    // IPv4 only: the TUN routes are v4-only, so every destination is v4.
     match ep.addr {
         IpAddress::Ipv4(a) => {
             buf.push(1);
-            buf.extend_from_slice(&a.octets());
-        }
-        IpAddress::Ipv6(a) => {
-            buf.push(4);
             buf.extend_from_slice(&a.octets());
         }
     }
@@ -774,14 +785,9 @@ fn parse_socks_udp(data: &[u8]) -> Option<(IpEndpoint, &[u8])> {
             let a = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
             (IpAddress::Ipv4(a), &data[8..])
         }
-        4 => {
-            if data.len() < 22 {
-                return None;
-            }
-            let mut o = [0u8; 16];
-            o.copy_from_slice(&data[4..20]);
-            (IpAddress::Ipv6(o.into()), &data[20..])
-        }
+        // ATYP 4 (IPv6) cannot occur: the tunnel carries IPv4 only, so every
+        // destination we ever asked about was v4.
+        4 => return None,
         _ => return None,
     };
     if rest.len() < 2 {
@@ -795,11 +801,12 @@ fn parse_socks_udp(data: &[u8]) -> Option<(IpEndpoint, &[u8])> {
 /// relay thread, datagrams that came back from the tunnel go onto the
 /// adapter with the original source endpoint. Idle sessions expire.
 fn pump_udp(
-    iface: &mut Interface,
+    _iface: &mut Interface,
     sockets: &mut SocketSet,
     sessions: &mut HashMap<u16, UdpEntry>,
 ) {
-    let cx = iface.context();
+    // smoltcp 0.12: UdpSocket::recv_slice/send_slice take no Context — the
+    // socket carries its own send metadata (UdpMetadata) per datagram.
     let now = std::time::Instant::now();
     let mut expired: Vec<u16> = Vec::new();
     for (src_port, entry) in sessions.iter_mut() {
@@ -808,7 +815,7 @@ fn pump_udp(
         // Application → tunnel.
         loop {
             let mut buf = [0u8; 65535];
-            match sock.recv(cx, &mut buf) {
+            match sock.recv_slice(&mut buf) {
                 Ok((n, meta)) => {
                     entry.last_seen = now;
                     let dst = meta.endpoint; // the remote the app was sending to
@@ -836,7 +843,7 @@ fn pump_udp(
                     // delivers the datagram to the application's socket: from
                     // the app's point of view the reply came from there.
                     let meta: UdpMetadata = src.into();
-                    let _ = sock.send_slice(cx, &data, meta);
+                    let _ = sock.send_slice(&data, meta);
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
