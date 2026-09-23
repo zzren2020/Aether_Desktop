@@ -432,6 +432,7 @@ const SECTIONS = {
     </div>`,
 
   transport: (p) => `
+    ${toggle(t('TUN mode (virtual adapter)'), 'tun', t('Route all traffic through the Aether adapter instead of the system proxy'), p.tun)}
     ${dropdown(t('Noize'), 'noize', NOIZE, p.noize)}
     ${dropdown(t('Endpoint'), 'endpointMode', ENDPOINT_MODES, p.endpointMode)}
     <div id="endpoint-extra">
