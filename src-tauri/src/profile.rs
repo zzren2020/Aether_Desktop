@@ -472,6 +472,17 @@ pub struct ConnectionProfile {
     pub keepalive: u32,
     pub fragment: bool,
     pub ech: bool,
+    // >>> AETHER-APP-FIX tun-relay-goes-live
+    /// v1.2.6 — مسیر دادهٔ TUN (آداپتورِ مجازیِ شبکه). پیش‌فرض **روشن**:
+    /// کاربر باید در «اتصالاتِ شبکه» یک آداپتور ببیند و کلِ ترافیک — نه فقط
+    /// TCPِ پروکسی‌شده — از تونل برود، دقیقاً مثل VpnService در اندروید.
+    /// آداپتور از همیشه ساخته می‌شد؛ با این پرچم، مسیرِ داده هم واقعاً از
+    /// روی آن می‌رود (`tun_relay.rs`). شکستش (مثلاً بدون Administrator)
+    /// اتصال را نمی‌کشد: مسیرِ پروکسیِ سیستمی جایگزین می‌شود و لاگ صادقانه
+    /// می‌گوید کدام مسیر زنده است.
+    #[serde(default = "default_tun")]
+    pub tun: bool,
+    // <<< AETHER-APP-FIX tun-relay-goes-live
     pub mtu: u32,
     // ---------------------------------------------------------------------
     // عمداً حذف شده نسبت به اندروید: `proxyMode`.
@@ -591,6 +602,10 @@ pub struct ConnectionProfile {
 }
 
 /// پیش‌فرضِ `serde` برای پروفایل‌هایی که پیش از ۱.۲.۳ ذخیره شده‌اند.
+fn default_tun() -> bool {
+    true
+}
+
 fn default_backend() -> TransportBackend {
     TransportBackend::Aether
 }
@@ -640,6 +655,7 @@ impl Default for ConnectionProfile {
             keepalive: 0,
             fragment: false,
             ech: false,
+            tun: true,
             mtu: DEFAULT_MTU,
             split_mode: SplitMode::Off,
             split_apps: Vec::new(),

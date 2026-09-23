@@ -243,6 +243,11 @@ pub struct AetherController {
     /// نتیجهٔ راه‌اندازی زنجیره در ترد پس‌زمینه — حلقهٔ tick مسدود نمی‌شود.
     chain_slot: Option<Arc<Mutex<Option<Result<u16, String>>>>>,
     tunnel: Option<Tunnel>,
+    // >>> AETHER-APP-FIX tun-relay-goes-live
+    /// Live TUN data path (adapter routes + userspace relay). Set when the
+    /// session is declared good, torn down before anything else on disconnect.
+    tun_relay: Option<crate::tun_relay::RelayHandle>,
+    // <<< AETHER-APP-FIX tun-relay-goes-live
     share: ShareBridge,
     sysproxy_on: bool,
     /// v1.2.0 — گارد نشتی WebRTC/UDP این نشست (Drop خودش آزادش می‌کند).
@@ -383,6 +388,7 @@ impl AetherController {
             psiphon: Arc::new(PsiphonTransport::new(&install_dir, data_dir)),
             chain_slot: None,
             tunnel: None,
+            tun_relay: None,
             share: ShareBridge::new(),
             sysproxy_on: false,
             guard: None,
@@ -1521,6 +1527,58 @@ impl AetherController {
 
     /// The visible state is already Disconnecting (see [`request_toggle`]); this
     /// runs the slow teardown on the tick thread, off the UI's IPC path.
+    // >>> AETHER-APP-FIX tun-relay-goes-live
+    /// Capture the default routes over the Wintun adapter and start the
+    /// userspace TUN→SOCKS5 relay — the machine-visible "virtual network
+    /// adapter" data path. Skipped honestly (with a log line) when the
+    /// setting is off, when the pipeline is Tor (pluggable-transport egress
+    /// must not be captured), or when the adapter/routes cannot come up
+    /// (administrator rights); the system-proxy path remains in every case.
+    fn engage_tun_data_path(&mut self) {
+        let profile = self.profile.clone();
+        if !profile.tun {
+            DiagnosticsLog::i(
+                TAG,
+                "TUN data path is disabled in settings — using the system-proxy data path.",
+            );
+            return;
+        }
+        if crate::leakguard::needs_pluggable_transport_egress(&profile) {
+            DiagnosticsLog::i(
+                TAG,
+                "Tor pipeline: the TUN default-route capture is skipped, because a system-wide capture would also swallow the pluggable transport's own egress. The system-proxy data path stays.",
+            );
+            return;
+        }
+        let Some(session) = self.tunnel.as_ref().and_then(|t| t.session()) else {
+            DiagnosticsLog::w(
+                TAG,
+                "No Wintun adapter for this session — using the system-proxy data path.",
+            );
+            return;
+        };
+        match crate::tun_relay::engage(session, profile.mtu as u16, engine::exit_socks_port()) {
+            Ok(handle) => {
+                // The adapter is the data path now; a system proxy pointing at
+                // the bridge would only shadow it for HTTP-aware clients.
+                if self.sysproxy_on {
+                    sysproxy::disable();
+                    self.sysproxy_on = false;
+                }
+                self.tun_relay = Some(handle);
+                DiagnosticsLog::i(
+                    TAG,
+                    "TUN data path engaged — the Aether adapter now carries the system's traffic.",
+                );
+            }
+            Err(e) => DiagnosticsLog::w(
+                TAG,
+                &format!("TUN data path failed ({e}); using the system-proxy data path."),
+            ),
+        }
+    }
+    // <<< AETHER-APP-FIX tun-relay-goes-live
+
     fn disconnect(&mut self) {
         self.cleanup_native(false);
         // v16: تیک‌های سبز Diagnostics باید بلافاصله بعد از دیسکانکت
@@ -1585,6 +1643,13 @@ impl AetherController {
         self.circuit_hunt_until = None;
         self.circuit_tries = 0;
         // <<< AETHER-APP-PATCH the-tor-in-front-is-the-real-tor
+        // >>> AETHER-APP-FIX tun-relay-goes-live
+        // The relay and its routes go FIRST: tearing down an adapter that
+        // still owns 0.0.0.0/1 is how a machine loses its internet.
+        if let Some(h) = self.tun_relay.take() {
+            h.shutdown();
+        }
+        // <<< AETHER-APP-FIX tun-relay-goes-live
         if let Some(mut t) = self.tunnel.take() {
             t.close();
         }
@@ -1944,6 +2009,13 @@ impl AetherController {
                         // this pipeline, not merely after the engine came up.
                         self.remember_the_rung_that_worked();
                         // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
+                        // >>> AETHER-APP-FIX tun-relay-goes-live
+                        // The session is good — NOW it is safe to capture the
+                        // default routes: the engine's own dials are pinned to
+                        // the real gateway first, so nothing loops. Failure
+                        // here is never fatal: the system-proxy path stays.
+                        self.engage_tun_data_path();
+                        // <<< AETHER-APP-FIX tun-relay-goes-live
                         self.set_state(ConnectionState::Connected, "");
                         DiagnosticsLog::i(TAG, "All checks passed — tunnel is ready.");
                         if out.exit.is_none() {
