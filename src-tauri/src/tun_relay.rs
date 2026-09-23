@@ -799,12 +799,17 @@ fn spawn_udp_relay(
                                 continue; // drop the datagram
                             }
                         }
-                        let (_, sock) = associate.as_ref().expect("established above");
-                        let mut gram = Vec::with_capacity(data.len() + 10);
-                        gram.extend_from_slice(&[0u8, 0, 0]); // RSV + FRAG
-                        push_endpoint(&mut gram, &dst);
-                        gram.extend_from_slice(&data);
-                        if sock.send(&gram).is_err() {
+                        let sent = match associate.as_ref() {
+                            Some((_, sock)) => {
+                                let mut gram = Vec::with_capacity(data.len() + 10);
+                                gram.extend_from_slice(&[0u8, 0, 0]); // RSV + FRAG
+                                push_endpoint(&mut gram, &dst);
+                                gram.extend_from_slice(&data);
+                                sock.send(&gram).is_ok()
+                            }
+                            None => false,
+                        };
+                        if !sent {
                             associate = None; // relay socket died; re-establish lazily
                         }
                     }
@@ -812,8 +817,10 @@ fn spawn_udp_relay(
                     Err(_) => return, // poll loop dropped the session
                 }
                 // Tunnel → application (only meaningful with a live associate).
-                if associate.is_some() {
-                    let (control, sock) = associate.as_ref().expect("checked above");
+                // `take()` keeps the borrow checker unambiguous: the pair is
+                // owned for the drain and restored only if still healthy.
+                if let Some((control, sock)) = associate.take() {
+                    let mut healthy = true;
                     loop {
                         match sock.recv(&mut buf) {
                             Ok(n) => {
@@ -835,15 +842,13 @@ fn spawn_udp_relay(
                                 break
                             }
                             Err(_) => {
-                                associate = None;
+                                healthy = false;
                                 break;
                             }
                         }
                     }
-                    if let Some((control, _)) = associate.as_ref() {
-                        if !control_alive(control) {
-                            return;
-                        }
+                    if healthy && control_alive(&control) {
+                        associate = Some((control, sock));
                     }
                 }
             }
