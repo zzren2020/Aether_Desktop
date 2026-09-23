@@ -404,9 +404,17 @@ pub unsafe extern "C" fn aether_scan_start(identity: u64, payload: *const c_char
 
         spawn_job(move |cancel| async move {
             let mut request = request;
-            if want_ech {
+            // >>> AETHER-APP-FIX warp-masque-does-not-accept-ech
+            // WARP's MASQUE (connect-ip) edges do not accept ECH — the mobile
+            // core measured and logs `ECH disabled (warp masque endpoint does
+            // not accept ECH)`. The desktop 2026-09-23 MIM log shows why the
+            // injected config hurts: with ECH in the ClientHello the outer hop
+            // timed out and answered `TLS alert 121 (unrecognised alert)` while
+            // the same edge had validated cleanly without it.
+            if want_ech && !matches!(request.transport, api::Transport::Masque) {
                 request.ech_config_list = api::fetch_ech_config().await;
             }
+            // <<< AETHER-APP-FIX warp-masque-does-not-accept-ech
             let endpoint = api::scan(&identity, &request, &cancel)
                 .await
                 .map_err(describe)?;
@@ -462,9 +470,14 @@ pub unsafe extern "C" fn aether_tunnel_start(identity: u64, payload: *const c_ch
 
         spawn_job(move |cancel| async move {
             let mut spec = spec;
-            if want_ech && matches!(spec.transport, api::Transport::Masque) {
+            // >>> AETHER-APP-FIX warp-masque-does-not-accept-ech
+            // See the scan-side note: WARP MASQUE edges do not accept ECH, so
+            // the toggle is honored everywhere EXCEPT the masque transport,
+            // where injecting it only turns a working endpoint into alert 121.
+            if want_ech && !matches!(spec.transport, api::Transport::Masque) {
                 spec.ech = api::fetch_ech_config().await;
             }
+            // <<< AETHER-APP-FIX warp-masque-does-not-accept-ech
 
             match api::connect(&identity, peer, &spec, &cancel).await {
                 Ok(()) => Ok(json!({"state": "closed"})),

@@ -573,7 +573,22 @@ impl WgTunnel {
             }
         });
 
-        let stale_timeout = wg_stale_timeout();
+        // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
+        // The budget is `self.stale_timeout` (bound at line 292), NOT a fresh
+        // `wg_stale_timeout()`.
+        //
+        // This line used to re-read `wg_stale_timeout()` here, which shadowed
+        // the correct value and made every hop — including the carrier hop,
+        // which is given 45 s — die after 10 s of silence. The 2026-09-23
+        // WARP-in-WARP log is that bug: `[wg] no valid data from peer
+        // 162.159.195.244:946 in 10.6450912s`, i.e. the outer hop killed on the
+        // inner hop's budget. The plumbing was right all the way from
+        // `run_warp_in_warp` through `from_established_with_stale`; this one
+        // line threw it away.
+        //
+        // `Duration` is `Copy`, so the `async move` below captures it directly.
+        let stale_timeout = stale_timeout;
+        // <<< AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
         let health_task = tokio::spawn(async move {
             let mut out_buf = vec![0u8; MAX_PACKET];
             loop {

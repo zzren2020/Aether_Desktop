@@ -1951,6 +1951,30 @@ fn inner_masque_candidates(outer: SocketAddr, count: usize) -> Vec<SocketAddr> {
         }
     }
 
+    // >>> AETHER-APP-FIX inner-pool-rides-the-measured-ladder
+    // 1b) The measured gateway ladder the outer hunt trusts, port-major on the
+    // alternate UDP ports. The 2026-09-23 desktop MIM log walked seven inner
+    // candidates that were all seed-pool addresses the mobile core measured at
+    // 0/4 connect-ip answers (TLS alert 40 on four of them, alert 46 and 49 on
+    // two more) and never tried the four gateways that DID answer, on the four
+    // alternate UDP ports they answer on — the same ladder the plain MASQUE
+    // hunt walks, so an inner candidate here is never an address the hunt
+    // itself would refuse to dial.
+    let verified: &[&str] = if want_v6 { &[] } else { prober::MASQUE_VERIFIED_GATEWAYS };
+    for entry in verified {
+        if let Ok(ip) = entry.parse::<IpAddr>() {
+            push(&mut out, &mut seen, SocketAddr::new(ip, MASQUE_INNER_PORT));
+        }
+    }
+    for &port in prober::MASQUE_ALT_PORTS {
+        for entry in verified {
+            if let Ok(ip) = entry.parse::<IpAddr>() {
+                push(&mut out, &mut seen, SocketAddr::new(ip, port));
+            }
+        }
+    }
+    // <<< AETHER-APP-FIX inner-pool-rides-the-measured-ladder
+
     // 2) The documented seed pool for this address family.
     let seeds: &[&str] = if want_v6 {
         prober::MASQUE_SEEDS_V6
@@ -3078,6 +3102,19 @@ async fn establish_wg(
     stale: std::time::Duration,
     label: &'static str,
 ) -> Result<(netstack::StackHandle, TunnelExit)> {
+    // >>> AETHER-APP-FIX gool-carrier-is-always-balanced
+    // The carrier hop is raised with the fixed `balanced` profile, NOT with
+    // whatever `AETHER_NOIZE` says. The mobile core ships the same rule
+    // (`GOOL_OUTER_PROFILE`): the panel's `--noize off` describes the user's
+    // preference for the scan and for plain WireGuard, but a warp-in-warp
+    // carrier whose obfuscation is switched off passes handshake and data-plane
+    // validation and then gets its real traffic strangled by DPI — the
+    // 2026-09-23 log: outer validated, then `18 pkts, 2 KB (0 KB/s)` of uplink
+    // and silence until the hop was judged dead. The scan-time verification
+    // inside this function re-runs under `balanced` anyway, so a peer chosen
+    // under another profile is still verified under the profile it will use.
+    const GOOL_OUTER_PROFILE: &str = "balanced";
+    // <<< AETHER-APP-FIX gool-carrier-is-always-balanced
     // >>> AETHER-APP-FIX the-carrier-hop-is-not-the-data-path
     // A hop whose keepalive is longer than the budget it is given before being
     // judged dead is guaranteed to be judged dead while its keepalive is still
@@ -3093,11 +3130,14 @@ async fn establish_wg(
         .parse()
         .map_err(|_| AetherError::Other("invalid ipv4".into()))?;
 
+    // >>> AETHER-APP-FIX gool-carrier-is-always-balanced
     let profile = if obfuscate {
-        aethernoize_config()
+        log::info!("[+] [{label}] carrier obfuscation profile: {GOOL_OUTER_PROFILE} (fixed)");
+        aethernoize::from_profile(GOOL_OUTER_PROFILE)
     } else {
         aethernoize::from_profile("off")
     };
+    // <<< AETHER-APP-FIX gool-carrier-is-always-balanced
 
     log::info!("[*] [{label}] validating WireGuard tunnel with {peer} (handshake + data-plane)...");
     let (_, session) = wireguard::verify_endpoint_keep_session(

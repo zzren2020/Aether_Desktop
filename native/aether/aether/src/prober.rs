@@ -14,14 +14,47 @@ pub const MASQUE_DOCUMENTED_CIDRS_V4: &[&str] = &["162.159.197.0/24", "162.159.1
 
 pub const MASQUE_DOH_CIDRS_V4: &[&str] = &["162.159.36.0/24", "162.159.46.0/24"];
 
+// >>> AETHER-APP-FIX masque-seeds-are-measured-not-guessed
+// The seed list and the CIDR order below are the 2026-09-02 re-measurement the
+// mobile core shipped (freshly enrolled device certificate, four connect-ip
+// attempts per address, judged only by `:status 200`):
+//
+//   162.159.199.1   4/4 :status 200   best 80ms
+//   162.159.199.2   4/4 :status 200   best 87ms
+//   162.159.198.2   3/4 :status 200   best 81ms  (the endpoint the API assigns)
+//   162.159.198.1   2/4 :status 200   best 113ms
+//   162.159.197.1   0/4
+//   162.159.197.2   0/4
+//   162.159.197.3   0/4
+//   162.159.204.2   0/4
+//   162.159.204.3   0/4
+//   162.159.196.1   0/4
+//   162.159.196.2   0/4
+//   162.159.195.1   0/4
+//   162.159.192.1   0/4
+//   162.159.193.1   0/4
+//
+// Three findings drive the layout:
+//
+//   * 162.159.199.0/24 — the two best gateways on the fleet — was missing from
+//     the list entirely, so those edges were unreachable by seed and by sweep
+//     alike. The desktop 2026-09-23 MIM log matches this defect exactly: every
+//     inner candidate (196.1, 195.1, 192.1, 197.3, 197.1, 198.1, 198.2) came
+//     back TLS alert 40/46/49 while the one edge the account had actually
+//     assigned (198.2) carried the outer hop fine.
+//   * "Completes the QUIC handshake" is not evidence of a gateway: the 197.x
+//     and 204.x addresses finish TLS and then never answer connect-ip.
+//   * One probe is not a verdict — working gateways missed attempts, so the
+//     ranking was only written after four samples per address.
 pub const MASQUE_CIDRS_V4: &[&str] = &[
+    "162.159.199.0/24",
+    "162.159.198.0/24",
+    "162.159.197.0/24",
     "162.159.196.0/24",
     "162.159.195.0/24",
     "162.159.192.0/24",
     "162.159.193.0/24",
     "162.159.204.0/24",
-    "162.159.197.0/24",
-    "162.159.198.0/24",
     "172.65.251.0/24",
     "188.114.96.0/24",
     "188.114.97.0/24",
@@ -32,15 +65,42 @@ pub const MASQUE_CIDRS_V4: &[&str] = &[
 ];
 
 pub const MASQUE_SEEDS: &[&str] = &[
-    "162.159.196.1",
-    "162.159.195.1",
-    "162.159.192.1",
-    "162.159.197.3",
-    "162.159.197.1",
+    "162.159.199.1",
+    "162.159.199.2",
     "162.159.198.2",
     "162.159.198.1",
-    "162.159.193.1",
+    "162.159.197.1",
+    "162.159.204.2",
 ];
+
+/// The addresses measured answering `:status 200` to connect-ip, best first.
+///
+/// Kept separate from [`MASQUE_SEEDS`] because the start path needs to know
+/// *which* peers are worth a second chance on another UDP port: retrying an
+/// ordinary Cloudflare edge on UDP/1701 is pointless (it has no connect-ip
+/// listener on any port), while retrying a real gateway there is the escape
+/// from a carrier that degrades UDP/443 to this range specifically.
+pub const MASQUE_VERIFIED_GATEWAYS: &[&str] = &[
+    "162.159.199.1",
+    "162.159.199.2",
+    "162.159.198.2",
+    "162.159.198.1",
+];
+
+/// Alternate UDP ports a verified gateway was measured serving connect-ip on.
+///
+/// Two attempts per (gateway, port) across all four verified gateways with an
+/// enrolled certificate, counting only connect-ip `:status 200`:
+///
+/// ```text
+///                :500  :1701  :4500  :8095
+/// 162.159.199.1   2/2   2/2    2/2    2/2
+/// 162.159.199.2   1/2   0/2    1/2    2/2
+/// 162.159.198.2   1/2   2/2    1/2    1/2
+/// 162.159.198.1   2/2   0/2    1/2    2/2
+/// ```
+pub const MASQUE_ALT_PORTS: &[u16] = &[1701, 8095, 500, 4500];
+// <<< AETHER-APP-FIX masque-seeds-are-measured-not-guessed
 
 pub const MASQUE_PORTS: &[u16] = &[443, 500, 1701, 4500, 4443, 8443, 8095];
 
