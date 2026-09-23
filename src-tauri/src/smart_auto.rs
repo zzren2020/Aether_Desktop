@@ -411,6 +411,83 @@ pub fn build_plan(user: &ConnectionProfile, fp: NetFingerprint) -> Vec<Candidate
     plan
 }
 
+// >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+/// The `prefs.json` key holding the rung that last carried traffic.
+pub const WORKING_RUNG_KEY: &str = "last_working_rung";
+
+/// The name a rung is remembered under.
+///
+/// Taken from `Protocol`'s own serde spelling rather than a hand-written table,
+/// so a protocol added later is remembered correctly without anyone having to
+/// remember to extend a match here.
+pub fn rung_name(protocol: Protocol) -> Option<String> {
+    serde_json::to_value(protocol)
+        .ok()?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Read a remembered rung name back. An unknown name is `None`, not an error:
+/// a preference written by a different build must not stop a connection.
+pub fn rung_from_name(name: &str) -> Option<Protocol> {
+    serde_json::from_value(serde_json::Value::String(name.to_string())).ok()
+}
+
+/// Rotate a plan so the rung that worked last time is tried first.
+///
+/// # Why the *starting* rung matters more than it looks
+///
+/// A rung the carrier blocks outright does not fail fast. MASQUE keeps scanning
+/// gateways until its budget expires, so a wrong starting rung does not cost one
+/// probe — it costs most of a minute, and it costs it again on the next connect,
+/// because the ladder is rebuilt from the same fixed order every time. This is
+/// the mobile core's finding, and the reason it stores the working rung on the
+/// device instead of deriving it again: *the ordering only decides the very
+/// first attempt.*
+///
+/// # What this does not do
+///
+/// It does not drop the other rungs, and it does not reorder them among
+/// themselves. The rotation wraps, so every rung still gets its turn in the same
+/// relative order — the memory only decides where the ladder starts. A wrong
+/// memory therefore costs one rung, not the session.
+///
+/// # When it does nothing
+///
+/// * nothing is remembered (`None`) — the first run, or the memory was cleared;
+/// * the remembered protocol is not in this plan — the ladder is chosen per
+///   network fingerprint, so a rung that is absent was never offered here;
+/// * the remembered rung is already first.
+pub fn the_rung_that_worked_goes_first(
+    plan: Vec<Candidate>,
+    worked: Option<Protocol>,
+) -> Vec<Candidate> {
+    let Some(worked) = worked else {
+        return plan;
+    };
+    // The *first* match, which is the plain pass: `auto_plan` appends a hardened
+    // second pass over the same protocols, and the cheap attempt is the one the
+    // memory is about.
+    let Some(start) = plan.iter().position(|c| c.profile.protocol == worked) else {
+        return plan;
+    };
+    if start == 0 {
+        return plan;
+    }
+
+    let mut rotated = plan;
+    rotated.rotate_left(start);
+    DiagnosticsLog::i(
+        TAG,
+        &format!(
+            "Rung memory: starting the ladder at {worked:?} (position {start}), the rung that \
+             carried traffic last time. The other rungs keep their order and still get their turn."
+        ),
+    );
+    rotated
+}
+// <<< AETHER-APP-FIX the-rung-that-worked-goes-first
+
 /// بودجهٔ یک تلاشِ تور-جلو — معادل `torBudget` اندروید.
 ///
 /// وقتی پل مجاز است، بودجه باید جای fallbackِ خودِ هسته روی پل‌ها را هم داشته
@@ -1015,4 +1092,132 @@ mod tests {
         assert!(plan[0].timeout_ms > LAST_RESORT_MS);
     }
     // <<< AETHER-APP-FIX plain-pass-goes-last-on-a-filtered-network
+
+    // >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+    /// پله زیر همان نامی ذخیره می‌شود که `Protocol` خودش با serde می‌نویسد —
+    /// نه جدولی دستی که با اضافه‌شدنِ پروتکلِ بعدی از قلم می‌افتد.
+    ///
+    /// این تست همان تلهٔ `AUTO` را هم می‌بندد: `Smart` نامِ نردبان است نه پلهٔ
+    /// آن، و اگر روزی کسی آن را به فهرست پله‌ها اضافه کند اینجا لو می‌رود.
+    #[test]
+    fn a_rung_is_remembered_under_its_own_serde_spelling() {
+        assert_eq!(rung_name(Protocol::Wireguard).as_deref(), Some("WIREGUARD"));
+        assert_eq!(rung_name(Protocol::Masque).as_deref(), Some("MASQUE"));
+        assert_eq!(rung_name(Protocol::Gool).as_deref(), Some("GOOL"));
+        assert_eq!(rung_name(Protocol::Mim).as_deref(), Some("MIM"));
+
+        for p in [
+            Protocol::Masque,
+            Protocol::Wireguard,
+            Protocol::Gool,
+            Protocol::Mim,
+        ] {
+            let name = rung_name(p).expect("هر پله یک نام دارد");
+            assert_eq!(rung_from_name(&name), Some(p), "رفت‌وبرگشتِ {name}");
+        }
+    }
+
+    /// نامِ ناشناس خطا نیست، `None` است. یک ترجیحِ نوشته‌شده توسط نسخهٔ دیگر
+    /// (یا فایلِ دست‌کاری‌شده) نباید اتصال را متوقف کند.
+    #[test]
+    fn an_unknown_rung_name_is_simply_forgotten() {
+        assert_eq!(rung_from_name("NOPE"), None);
+        assert_eq!(rung_from_name(""), None);
+        assert_eq!(rung_from_name("masque"), None, "سرِنام حساس است");
+    }
+
+    /// بی حافظه، نردبان دست‌نخورده می‌ماند: اولین اجرا، یا حافظهٔ پاک‌شده.
+    #[test]
+    fn with_no_memory_the_ladder_keeps_its_order() {
+        let p = ConnectionProfile::default();
+        let plan = build_plan(&p, NetFingerprint::default());
+        let labels: Vec<String> = plan.iter().map(|c| c.label.clone()).collect();
+
+        let same = the_rung_that_worked_goes_first(plan, None);
+        assert_eq!(
+            same.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+            labels
+        );
+    }
+
+    /// حافظه‌ای که همین حالا اول است هیچ کاری نمی‌کند — و مهم‌تر، هیچ لاگی هم
+    /// نمی‌نویسد: این تابع در هر اتصال صدا زده می‌شود و لاگِ بی‌خبر، لاگ را
+    /// بی‌مصرف می‌کند.
+    #[test]
+    fn a_memory_that_already_leads_changes_nothing() {
+        let p = ConnectionProfile::default();
+        let plan = build_plan(&p, NetFingerprint::default());
+        let lead = plan[0].profile.protocol;
+        let labels: Vec<String> = plan.iter().map(|c| c.label.clone()).collect();
+
+        let same = the_rung_that_worked_goes_first(plan, Some(lead));
+        assert_eq!(
+            same.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+            labels
+        );
+    }
+
+    /// پلهٔ به‌یادمانده از میانهٔ نردبان جلو می‌آید؛ هیچ پله‌ای حذف نمی‌شود و
+    /// ترتیبِ نسبیِ بقیه عوض نمی‌شود.
+    ///
+    /// این همان تفاوتِ «چرخش» با «مرتب‌سازی» است: حافظه فقط تصمیم می‌گیرد
+    /// نردبان از کجا شروع شود. اگر اشتباه باشد یک پله هزینه دارد، نه کل نشست.
+    #[test]
+    fn the_remembered_rung_moves_to_the_front_and_the_rest_keep_their_order() {
+        let p = ConnectionProfile::default();
+        let plan = build_plan(&p, NetFingerprint::default());
+
+        let before: Vec<Protocol> = plan.iter().map(|c| c.profile.protocol).collect();
+        let at = before
+            .iter()
+            .position(|x| *x == Protocol::Masque)
+            .expect("MASQUE باید روی نردبان باشد");
+        assert!(at > 0, "این تست فقط وقتی معنا دارد که حافظه چیزی را جابه‌جا کند");
+
+        let len = plan.len();
+        let mut expected: Vec<String> = plan.iter().map(|c| c.label.clone()).collect();
+        expected.rotate_left(at);
+
+        let rotated = the_rung_that_worked_goes_first(plan, Some(Protocol::Masque));
+
+        assert_eq!(rotated.len(), len, "هیچ پله‌ای حذف نمی‌شود");
+        assert_eq!(rotated[0].profile.protocol, Protocol::Masque);
+        assert_eq!(
+            rotated.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+            expected,
+            "چرخش باید دقیق باشد، نه بازچینش"
+        );
+        // و همان چندگانگیِ پله‌ها دست‌نخورده: ترتیبِ پروتکل‌ها دستِ این اصلاح نیست.
+        let mut sorted_before = before.clone();
+        let mut sorted_after: Vec<Protocol> = rotated.iter().map(|c| c.profile.protocol).collect();
+        sorted_before.sort_by_key(|p| format!("{p:?}"));
+        sorted_after.sort_by_key(|p| format!("{p:?}"));
+        assert_eq!(sorted_after, sorted_before);
+    }
+
+    /// حافظه‌ای که به این نردبان مربوط نیست نادیده گرفته می‌شود. نردبان بر پایهٔ
+    /// اثرانگشتِ شبکه ساخته می‌شود، پس پله‌ای که اینجا نیست هرگز اینجا پیشنهاد
+    /// نشده بود — و `Smart` نامِ نردبان است، نه پله‌ای از آن.
+    #[test]
+    fn a_remembered_rung_that_is_not_on_this_ladder_is_ignored() {
+        let p = ConnectionProfile::default();
+        let plan = build_plan(&p, NetFingerprint::default());
+        assert!(
+            !plan.iter().any(|c| c.profile.protocol == Protocol::Mim),
+            "MIM پلهٔ Smart Auto نیست: {:?}",
+            plan.iter().map(|c| c.profile.protocol).collect::<Vec<_>>()
+        );
+        let labels: Vec<String> = plan.iter().map(|c| c.label.clone()).collect();
+
+        for stale in [Protocol::Mim, Protocol::Smart] {
+            let fresh = build_plan(&p, NetFingerprint::default());
+            let same = the_rung_that_worked_goes_first(fresh, Some(stale));
+            assert_eq!(
+                same.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+                labels,
+                "{stale:?} نباید نردبان را بازچینش کند"
+            );
+        }
+    }
+    // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
 }

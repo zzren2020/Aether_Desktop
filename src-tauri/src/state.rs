@@ -29,7 +29,7 @@ use crate::psiphon::PsiphonTransport;
 use crate::psiphon_health;
 use crate::share::ShareBridge;
 use crate::smart_auto::{self, Candidate};
-use crate::store::ProfileStore;
+use crate::store::{PrefsStore, ProfileStore};
 use crate::sysproxy;
 use crate::tor_bootstrap;
 use crate::tun::Tunnel;
@@ -70,6 +70,29 @@ const CIRCUIT_HUNT_WINDOW: Duration = Duration::from_secs(20);
 /// می‌شود — همان اشتباهی که مستند موبایل «بدترین نتیجهٔ ممکن» می‌خواندش.
 const CHAIN_BUDGET_MS: u64 = 430_000;
 const WATCHDOG_FAILURE_THRESHOLD: u8 = 3;
+
+// >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+/// The window the self-test gets, granted the moment the local port opens.
+///
+/// The attempt deadline exists to bound *establishing* the tunnel, and it is
+/// usually spent by the time the port opens - the 2026-09-22 logs have the
+/// engine taking 65 s of a 75 s window. Handing the self-test whatever is left
+/// of that window means verifying a brand-new pipeline with zero runway: any
+/// single failed sample then refuses a connection that was seconds from working.
+///
+/// Once the port is open the tunnel *is* established, so the self-test gets a
+/// window of its own, sized so that one bad sample can be re-taken.
+const VERIFY_WINDOW_MS: u64 = 45_000;
+/// A chained pipeline warms up two hops, so it gets more room.
+const VERIFY_WINDOW_CHAINED_MS: u64 = 75_000;
+/// Ceiling on a single self-test sample.
+///
+/// The sample's own floor is 20 s, so this is what makes a second sample fit
+/// inside the window instead of one long sample consuming all of it.
+const VERIFY_SAMPLE_GRACE_MAX_MS: u64 = 20_000;
+/// How much window must remain before another sample is worth taking.
+const VERIFY_RETRY_MIN_REMAINING_MS: u64 = 20_000;
+// <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
 
 /// معادل دقیق `ConnectionState.kt` — همان هشت حالت، همان ترتیب.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +214,11 @@ struct PrepOutcome {
 pub struct AetherController {
     data_dir: PathBuf,
     store: ProfileStore,
+    // >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+    /// The device-local memory of which ladder rung last carried traffic. See
+    /// [`Self::remember_the_rung_that_worked`].
+    prefs: PrefsStore,
+    // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
     profile: ConnectionProfile,
     state: ConnectionState,
     detail: String,
@@ -230,6 +258,22 @@ pub struct AetherController {
     reconnect_at: Option<Instant>,
     /// نتیجهٔ خودآزمای در حال اجرا (ترد پس‌زمینه — UI فریز نمی‌شود).
     verify_slot: Option<Arc<Mutex<Option<diagnostics::SelfTestOutcome>>>>,
+    // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+    /// How many times this attempt has re-run the self-test after a failure
+    /// that was *not* a leak verdict. See [`Self::VERIFY_RETRY_LIMIT`].
+    verify_retries: u8,
+    /// Set once a leak verdict has cost this attempt one rung.
+    ///
+    /// A leak verdict is a statement about the *protection layer*, and the
+    /// ladder does not vary the protection layer - it varies noize,
+    /// fragmentation and ECH. So one advance is a fair second look (a firewall
+    /// rule or a policy value may still have been settling when the sample was
+    /// taken) and a second verdict is final. Without the cap, a machine with no
+    /// browser-scoped protection at all would spend a full verify window on
+    /// every rung before saying so. Reset in [`Self::launch_plan`], i.e. once
+    /// per attempt.
+    leak_refused: bool,
+    // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
     ip_slot: Arc<Mutex<IpSlot>>,
     /// پینگ زنده: نتیجهٔ آخرین اندازه‌گیری دوره‌ای در ترد پس‌زمینه.
     latency_slot: Arc<Mutex<Option<u64>>>,
@@ -320,6 +364,9 @@ impl AetherController {
         let me = Self {
             data_dir: data_dir.to_path_buf(),
             store,
+            // >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+            prefs: PrefsStore::new(data_dir),
+            // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
             profile,
             state: ConnectionState::Disconnected,
             detail: String::new(),
@@ -346,6 +393,8 @@ impl AetherController {
             deadline: None,
             reconnect_at: None,
             verify_slot: None,
+            verify_retries: 0,
+            leak_refused: false,
             ip_slot,
             latency_slot: Arc::new(Mutex::new(None)),
             latency_probe_at: None,
@@ -675,10 +724,74 @@ impl AetherController {
         } else {
             self.profile.clone()
         };
-        self.plan = smart_auto::build_plan(&planning_profile, fingerprint);
+        let plan = smart_auto::build_plan(&planning_profile, fingerprint);
+        // >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+        // The rung that worked last time leads. The rotation wraps, so every
+        // other rung keeps its place and still gets its turn; see
+        // [`smart_auto::the_rung_that_worked_goes_first`].
+        self.plan = smart_auto::the_rung_that_worked_goes_first(plan, self.remembered_rung());
+        // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
         self.plan_index = 0;
+        // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+        // A fresh attempt gets a fresh leak-verdict allowance; see
+        // [`Self::leak_refused`].
+        self.leak_refused = false;
+        // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
         self.launch_candidate()
     }
+
+    // >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+    /// The rung that last carried traffic on this device, if any is remembered.
+    ///
+    /// Read from disk rather than held in memory on purpose: the desktop process
+    /// lives longer than the phone's core, so an in-memory memory would cover
+    /// reconnects within one run — but the case that costs the most is the one
+    /// where the user closed the app and opened it again, and only a written
+    /// preference survives that.
+    fn remembered_rung(&self) -> Option<Protocol> {
+        self.prefs
+            .get_string(smart_auto::WORKING_RUNG_KEY)
+            .and_then(|name| smart_auto::rung_from_name(&name))
+    }
+
+    /// Records the rung that just carried traffic.
+    ///
+    /// Called on a *verified* session, never on a raised one. A tunnel that comes
+    /// up and carries nothing is exactly the case this memory must not learn
+    /// from — otherwise the next connect starts on the rung that never worked,
+    /// and the memory has made things worse rather than better.
+    fn remember_the_rung_that_worked(&mut self) {
+        let Some(protocol) = self.effective_protocol else {
+            return;
+        };
+        // `Smart` names the ladder, not a rung of it. There is nothing to
+        // remember, and writing it would only put noise on disk.
+        if matches!(protocol, Protocol::Smart) {
+            return;
+        }
+        let Some(name) = smart_auto::rung_name(protocol) else {
+            return;
+        };
+        if self.prefs.get_string(smart_auto::WORKING_RUNG_KEY).as_deref() == Some(name.as_str()) {
+            return;
+        }
+
+        match self.prefs.set_string(smart_auto::WORKING_RUNG_KEY, &name) {
+            Ok(()) => DiagnosticsLog::i(
+                TAG,
+                &format!(
+                    "Rung memory: {name} carried traffic — the next connect starts the ladder there."
+                ),
+            ),
+            // Never fatal. A preference that cannot be written costs one
+            // slower start, and refusing to connect over it would be absurd.
+            Err(e) => DiagnosticsLog::w(
+                TAG,
+                &format!("Could not remember the working rung ({e}); the ladder keeps its fixed order."),
+            ),
+        }
+    }
+    // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
 
     /// اجرای یک پله از نردبان — معادل یک دور `runLadder`.
     ///
@@ -1354,6 +1467,28 @@ impl AetherController {
 
     /// خودآزمای ۴ مرحله‌ای در ترد پس‌زمینه — حلقهٔ tick هرگز مسدود نمی‌شود.
     fn begin_verification(&mut self) {
+        // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+        // A fresh pipeline gets a fresh retry budget, and a window of its own -
+        // see [`Self::VERIFY_WINDOW_MS`] for why the attempt deadline is the
+        // wrong clock for this phase.
+        self.verify_retries = 0;
+        let window = if self.profile.is_chained() {
+            Self::VERIFY_WINDOW_CHAINED_MS
+        } else {
+            Self::VERIFY_WINDOW_MS
+        };
+        self.deadline = Some(Instant::now() + Duration::from_millis(window));
+        // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+        self.spawn_self_test();
+    }
+
+    /// Re-runs the self-test on the *same* pipeline, without touching the retry
+    /// budget. See [`Self::VERIFY_RETRY_LIMIT`].
+    fn respawn_self_test(&mut self) {
+        self.spawn_self_test();
+    }
+
+    fn spawn_self_test(&mut self) {
         let slot: Arc<Mutex<Option<diagnostics::SelfTestOutcome>>> = Arc::new(Mutex::new(None));
         self.verify_slot = Some(slot.clone());
         let remaining = self
@@ -1367,7 +1502,13 @@ impl AetherController {
         } else {
             OUTBOUND_GRACE_MS
         };
-        let grace = remaining.clamp(20_000, ceiling);
+        // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+        // ...but a single sample is capped, so that one slow sample cannot eat
+        // the whole window and leave nothing for the re-check.
+        let grace = remaining
+            .clamp(20_000, ceiling)
+            .min(Self::VERIFY_SAMPLE_GRACE_MAX_MS);
+        // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
         std::thread::Builder::new()
             .name("aether-selftest".into())
             .spawn(move || {
@@ -1459,10 +1600,24 @@ impl AetherController {
 
     /// شکست یک پله → پلهٔ بعدی نردبان؛ تمام‌شدن نردبان → Failed با پیام روشن.
     fn advance_or_fail(&mut self, why: &str) {
+        let final_message = if self.profile.protocol == Protocol::Smart {
+            "Smart Auto tried every strategy and none passed the self-test on this network."
+        } else {
+            "This protocol could not establish a working tunnel on this network, even with anti-DPI hardening. Try Smart Auto or another protocol."
+        };
+        self.advance_or_fail_with(why, final_message);
+    }
+
+    // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+    /// [`Self::advance_or_fail`] with a specific message for the case where the
+    /// ladder runs out, so a failure that deserves its own wording does not have
+    /// to skip the remaining rungs to get it.
+    fn advance_or_fail_with(&mut self, why: &str, final_message: &str) {
         DiagnosticsLog::w(TAG, &format!("{why} — tearing down this attempt."));
         // فقط موتور/مسیر داده را جمع می‌کنیم، وضعیت UI همچنان busy می‌ماند.
         self.cleanup_native(true);
         self.verify_slot = None;
+        self.verify_retries = 0;
         diagnostics::reset_checks();
         self.plan_index += 1;
         if self.plan_index < self.plan.len() {
@@ -1470,16 +1625,51 @@ impl AetherController {
             // through the off-lock prep instead of blocking the tick for 3s.
             self.set_state(ConnectionState::StartingEngine, "Starting engine…");
             self.begin_prep(Prep::Candidate);
-        } else if self.profile.protocol == Protocol::Smart {
-            self.fail(
-                "Smart Auto tried every strategy and none passed the self-test on this network.",
-            );
         } else {
-            self.fail(
-                "This protocol could not establish a working tunnel on this network, even with anti-DPI hardening. Try Smart Auto or another protocol.",
-            );
+            self.fail(final_message);
         }
     }
+
+    /// How many extra self-test samples one attempt gets before the ladder moves
+    /// on.
+    ///
+    /// The self-test is a *sample* of a pipeline that is frequently still
+    /// warming up - a chained pipeline has two hops to bring up, and the engine
+    /// may be replacing a failed endpoint underneath it. Two extra samples cost
+    /// a few seconds and remove the whole class of failure where a connection
+    /// that would have worked ten seconds later is refused.
+    const VERIFY_RETRY_LIMIT: u8 = 2;
+
+    /// Is another sample worth taking on the pipeline we already have?
+    ///
+    /// Only when there is enough window left for the sample to mean something
+    /// and the pipeline's exit port still answers. That port is opened by the
+    /// carrier itself - `tor.exe` in "Tor only", the engine in front of it in
+    /// the chained modes - so a closed port already *is* the "carrier is gone"
+    /// signal, and the caller's fall-through arm, the one that asks the carrier
+    /// whether it is still there when no sample has come back yet, names it as
+    /// such 200 ms later, on the next tick.
+    ///
+    /// A second carrier question here would only move that verdict up by one
+    /// tick, and it would make this a *fifth* liveness call site in a file whose
+    /// four are pinned **by count**: `scripts/check-tor-native.py` requires at
+    /// least four, and control 2 of `scripts/check-tor-native-negative.sh`
+    /// deletes one and requires the guard to go red. A fifth call site keeps the
+    /// guard green under that mutation, i.e. it silently disarms the control.
+    fn can_retry_verification(&mut self) -> bool {
+        if self.verify_retries >= Self::VERIFY_RETRY_LIMIT {
+            return false;
+        }
+        let remaining = match self.deadline {
+            Some(d) => d.saturating_duration_since(Instant::now()).as_millis() as u64,
+            None => 0,
+        };
+        if remaining < Self::VERIFY_RETRY_MIN_REMAINING_MS {
+            return false;
+        }
+        probe::socks_ready(engine::exit_socks_port())
+    }
+    // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
 
     fn apply_pending_security_refresh(&mut self) {
         if !self.security_refresh_pending {
@@ -1748,6 +1938,12 @@ impl AetherController {
                             .is_some()
                             .then(|| Instant::now() + CIRCUIT_HUNT_WINDOW);
                         // <<< AETHER-APP-PATCH a-bad-circuit-is-not-a-bad-network
+                        // >>> AETHER-APP-FIX the-rung-that-worked-goes-first
+                        // Recorded here, at the one place a session is declared
+                        // good — after the self-test fetched a real page through
+                        // this pipeline, not merely after the engine came up.
+                        self.remember_the_rung_that_worked();
+                        // <<< AETHER-APP-FIX the-rung-that-worked-goes-first
                         self.set_state(ConnectionState::Connected, "");
                         DiagnosticsLog::i(TAG, "All checks passed — tunnel is ready.");
                         if out.exit.is_none() {
@@ -1756,9 +1952,53 @@ impl AetherController {
                     } else if out.leak.as_ref().map(|l| l.leaking).unwrap_or(false) {
                         // Fail closed. A tunnel that exposes the real IP is not
                         // a successful connection, even when TCP/DNS passed.
-                        self.fail(
-                            "Connection refused: WebRTC can still reach the real IP over direct UDP. Browser and system protection could not be verified.",
+                        //
+                        // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+                        // Through the ladder, not straight to `fail`. The
+                        // previous code called `fail` here, which skipped every
+                        // remaining rung: the 2026-09-22 WARP-in-WARP log says
+                        // `Plan ready (2 attempt(s))` and `Attempt 1/2`, and the
+                        // hardened anti-DPI rung was never tried. A verdict about
+                        // *this* pipeline is not a verdict about the other rungs.
+                        //
+                        // But the ladder gets one look, not an unlimited number:
+                        // see [`Self::leak_refused`]. A leak verdict is about the
+                        // protection layer, which no rung changes.
+                        let why = "Connection refused: WebRTC can still reach the real IP over \
+                                   direct UDP and no browser-scoped protection is installed.";
+                        let final_message = "This protocol could not establish a protected tunnel \
+                                              on this network: WebRTC could still reach the real IP \
+                                              over direct UDP. Turn the leak guard on, or restart \
+                                              the browser so the new policy is picked up.";
+                        if self.leak_refused {
+                            self.fail(final_message);
+                        } else {
+                            self.leak_refused = true;
+                            self.advance_or_fail_with(why, final_message);
+                        }
+                        // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+                    } else if self.can_retry_verification() {
+                        // >>> AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
+                        // The engine is alive and still owns the local port, so
+                        // the pipeline is not necessarily broken - it may simply
+                        // not have been ready when the sample was taken. The
+                        // 2026-09-22 WARP-in-WARP log shows exactly that: the
+                        // self-test ran while the engine was mid-reconnect and
+                        // reported `TCP via proxy failed`, and ~16 s later the
+                        // engine had a fresh validated pair of endpoints. The
+                        // connection had already been refused by then.
+                        self.verify_retries = self.verify_retries.saturating_add(1);
+                        DiagnosticsLog::w(
+                            TAG,
+                            &format!(
+                                "Self-test failed, but the engine is still up and the local port is \
+                                 still open — re-checking ({}/{}) before giving up on this attempt.",
+                                self.verify_retries,
+                                Self::VERIFY_RETRY_LIMIT
+                            ),
                         );
+                        self.respawn_self_test();
+                        // <<< AETHER-APP-FIX a-self-test-is-a-sample-not-a-verdict
                     } else {
                         self.advance_or_fail("Tunnel started, but the end-to-end self-test failed");
                     }
