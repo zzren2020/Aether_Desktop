@@ -91,11 +91,40 @@ const CHROMIUM_POLICY_KEYS: [&str; 7] = [
     r"HKCU\Software\Policies\Opera Software\Opera",
     r"HKCU\Software\Policies\Yandex\YandexBrowser",
 ];
-const CHROMIUM_POLICY_NAME: &str = "WebRtcIPHandlingPolicy";
-const CHROMIUM_POLICY_VALUE: &str = "disable_non_proxied_udp";
+// >>> AETHER-APP-FIX browsers-need-quic-off-not-just-webrtc-off
+// Two Chromium policy values per browser family. The first stops WebRTC from
+// leaving UDP; the second stops the browser from trying QUIC at all.
+//
+// Why the second one exists (2026-09-23 psiphon-over-masque log): the machine
+// had the Windows Firewall OFF, so the browser-scoped UDP kill-switch rules
+// were registered but never enforced — the log says exactly that — and the
+// data path is the system proxy, which is TCP-only. A Chromium browser behind
+// a proxy is *supposed* to fall back to TCP on its own, but while QUIC is
+// allowed it keeps trying direct UDP/443 to Google's hosts and every attempt
+// blackholes until the browser gives up on the request; Google and YouTube are
+// exactly the hosts that prefer HTTP/3. `QuicAllowed=false` is a policy the
+// browser honors without administrator rights, so the TCP-via-proxy path is
+// used from the first attempt, same mechanism and same restore path as the
+// WebRTC value.
+const CHROMIUM_POLICIES: [(&str, &str, &str, &str); 2] = [
+    // (value name, registry kind, data written, data as `reg query` echoes it)
+    ("WebRtcIPHandlingPolicy", "REG_SZ", "disable_non_proxied_udp", "disable_non_proxied_udp"),
+    ("QuicAllowed", "REG_DWORD", "0", "0x0"),
+];
+// <<< AETHER-APP-FIX browsers-need-quic-off-not-just-webrtc-off
 
 const FIREFOX_PREFS_KEY: &str = r"HKCU\Software\Policies\Mozilla\Firefox\Preferences";
-const FIREFOX_PREF_NAME: &str = "media.peerconnection.ice.proxy_only";
+
+// >>> AETHER-APP-FIX browsers-need-quic-off-not-just-webrtc-off
+// Same pair for Firefox: ICE behind the proxy only, and HTTP/3 off so the
+// proxy's TCP path is used from the first attempt. Written as hidden prefs via
+// the Policies\Preferences key, restored like every other edit here.
+const FIREFOX_PREFS: [(&str, &str, &str); 2] = [
+    // (pref name, data written, data as `reg query` echoes it)
+    ("media.peerconnection.ice.proxy_only", "1", "0x1"),
+    ("network.http.http3.enable", "0", "0x0"),
+];
+// <<< AETHER-APP-FIX browsers-need-quic-off-not-just-webrtc-off
 
 /// نشانهٔ «این مقدار را ما گذاشته‌ایم» — بدون آن purge_stale() هرگز به سیاستی
 /// که خود کاربر یا سازمانش تنظیم کرده دست نمی‌زند.
@@ -367,35 +396,39 @@ impl LeakGuard {
     /// لایهٔ ۱ — سیاست رسمی خود مرورگرها (بدون نیاز به دسترسی مدیر).
     fn apply_browser_policies(&mut self) {
         for key in CHROMIUM_POLICY_KEYS {
-            let previous = reg_read(key, CHROMIUM_POLICY_NAME);
-            if previous.as_deref() == Some(CHROMIUM_POLICY_VALUE) {
-                self.policies += 1;
-                continue; // از قبل درست بوده — دست نمی‌زنیم.
-            }
-            if reg_write(key, CHROMIUM_POLICY_NAME, "REG_SZ", CHROMIUM_POLICY_VALUE) {
-                reg_write(key, SENTINEL_NAME, "REG_DWORD", "1");
-                self.policies += 1;
-                self.edits.push(PolicyEdit {
-                    key: key.to_string(),
-                    name: CHROMIUM_POLICY_NAME.to_string(),
-                    kind: "REG_SZ",
-                    previous,
-                });
+            for (name, kind, data, readback) in CHROMIUM_POLICIES {
+                let previous = reg_read(key, name);
+                if previous.as_deref() == Some(readback) {
+                    self.policies += 1;
+                    continue; // از قبل درست بوده — دست نمی‌زنیم.
+                }
+                if reg_write(key, name, kind, data) {
+                    reg_write(key, SENTINEL_NAME, "REG_DWORD", "1");
+                    self.policies += 1;
+                    self.edits.push(PolicyEdit {
+                        key: key.to_string(),
+                        name: name.to_string(),
+                        kind,
+                        previous,
+                    });
+                }
             }
         }
 
-        let previous = reg_read(FIREFOX_PREFS_KEY, FIREFOX_PREF_NAME);
-        if previous.as_deref() == Some("0x1") {
-            self.policies += 1;
-        } else if reg_write(FIREFOX_PREFS_KEY, FIREFOX_PREF_NAME, "REG_DWORD", "1") {
-            reg_write(FIREFOX_PREFS_KEY, SENTINEL_NAME, "REG_DWORD", "1");
-            self.policies += 1;
-            self.edits.push(PolicyEdit {
-                key: FIREFOX_PREFS_KEY.to_string(),
-                name: FIREFOX_PREF_NAME.to_string(),
-                kind: "REG_DWORD",
-                previous,
-            });
+        for (name, data, readback) in FIREFOX_PREFS {
+            let previous = reg_read(FIREFOX_PREFS_KEY, name);
+            if previous.as_deref() == Some(readback) {
+                self.policies += 1;
+            } else if reg_write(FIREFOX_PREFS_KEY, name, "REG_DWORD", data) {
+                reg_write(FIREFOX_PREFS_KEY, SENTINEL_NAME, "REG_DWORD", "1");
+                self.policies += 1;
+                self.edits.push(PolicyEdit {
+                    key: FIREFOX_PREFS_KEY.to_string(),
+                    name: name.to_string(),
+                    kind: "REG_DWORD",
+                    previous,
+                });
+            }
         }
     }
 
@@ -656,13 +689,17 @@ pub fn purge_stale() {
     let mut cleaned = 0;
     for key in CHROMIUM_POLICY_KEYS {
         if reg_read(key, SENTINEL_NAME).is_some() {
-            reg_delete_value(key, CHROMIUM_POLICY_NAME);
+            for (name, _, _, _) in CHROMIUM_POLICIES {
+                reg_delete_value(key, name);
+            }
             reg_delete_value(key, SENTINEL_NAME);
             cleaned += 1;
         }
     }
     if reg_read(FIREFOX_PREFS_KEY, SENTINEL_NAME).is_some() {
-        reg_delete_value(FIREFOX_PREFS_KEY, FIREFOX_PREF_NAME);
+        for (name, _, _) in FIREFOX_PREFS {
+            reg_delete_value(FIREFOX_PREFS_KEY, name);
+        }
         reg_delete_value(FIREFOX_PREFS_KEY, SENTINEL_NAME);
         cleaned += 1;
     }
@@ -886,26 +923,24 @@ mod tests {
     #[test]
     fn parses_a_string_registry_value() {
         let out = "\r\nHKEY_CURRENT_USER\\Software\\Policies\\Google\\Chrome\r\n    WebRtcIPHandlingPolicy    REG_SZ    disable_non_proxied_udp\r\n";
+        let (name, _, _, readback) = CHROMIUM_POLICIES[0];
         assert_eq!(
-            parse_reg_value(out, CHROMIUM_POLICY_NAME).as_deref(),
-            Some(CHROMIUM_POLICY_VALUE)
+            parse_reg_value(out, name).as_deref(),
+            Some(readback)
         );
     }
 
     #[test]
     fn parses_a_dword_registry_value() {
         let out = "    media.peerconnection.ice.proxy_only    REG_DWORD    0x1\r\n";
-        assert_eq!(
-            parse_reg_value(out, FIREFOX_PREF_NAME).as_deref(),
-            Some("0x1")
-        );
+        let (name, _, readback) = FIREFOX_PREFS[0];
+        assert_eq!(parse_reg_value(out, name).as_deref(), Some(readback));
     }
 
     #[test]
     fn missing_value_is_none() {
-        assert!(
-            parse_reg_value("ERROR: The system was unable to find", CHROMIUM_POLICY_NAME).is_none()
-        );
+        let (name, _, _, _) = CHROMIUM_POLICIES[0];
+        assert!(parse_reg_value("ERROR: The system was unable to find", name).is_none());
     }
 
     #[test]
