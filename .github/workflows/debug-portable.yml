@@ -1,0 +1,333 @@
+# =============================================================================
+#  Debug Portable (x64) - یک ZIPِ قابل‌اجرا برای دست‌گرفتنِ سریع
+# -----------------------------------------------------------------------------
+#  چرا این فایل جدا است:
+#
+#  بیلدِ اصلی (`build.yml`) هر بار دو معماری (x64 + x86) می‌سازد و برای هرکدام
+#  یک نصب‌کنندهٔ Inno Setup هم تولید می‌کند — یعنی هر اجرا حدودِ ۸۰ دقیقه از
+#  سهمیهٔ ویندوز. وقتی سؤال فقط این است که «کد کامپایل می‌شود و یک بستهٔ
+#  قابل‌اجرا می‌دهد یا نه»، پرداختنِ آن هزینه معنا ندارد.
+#
+#  این workflow فقط:
+#    * x64 می‌سازد (نه x86)،
+#    * فقط ZIPِ پرتابل می‌سازد (نه نصب‌کننده، نه امضا، نه تستِ نصب)،
+#    * با `workflow_dispatch` اجرا می‌شود — **هرگز خودکار**.
+#
+#  تفاوتِ دیگر با build.yml: اینجا `sync-core` اجرا نمی‌شود. هستهٔ ۲.۰.۰ در
+#  خودِ مخزن است (`native/aether/`، فایل `CORE_VERSION`)، نه یک submodule —
+#  فایل `.gitmodules` وجود ندارد. پس این workflow همان هستهٔ کامیت‌شده را
+#  می‌سازد، که اتفاقاً برای دیباگ بهتر است: نتیجه به چیزی که بالادست در همان
+#  لحظه منتشر کرده وابسته نیست.
+# =============================================================================
+name: Debug Portable x64
+
+# فقط دستی. نه push، نه pull_request، نه schedule — ویرایشِ کد در خودِ گیت‌هاب
+# نباید یک بیلدِ ۸۰ دقیقه‌ای را روشن کند.
+on:
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Set to 'on' to skip cargo test and just compile + package (faster, but a broken test will not stop you)."
+        required: false
+        default: 'off'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: debug-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # دیباگ: برخلاف build.yml اینجا full است، تا محل دقیقِ پنیک/خطا در لاگ باشد.
+  RUST_BACKTRACE: full
+  RUST_LOG: debug
+  # ثابت‌های x64 — این workflow تک‌معماریه است.
+  ARCH: x64
+  RUST_TARGET: x86_64-pc-windows-msvc
+  WINTUN_DIR: bin/amd64
+  # همان نسخه‌ای که مخزن اندروید به‌شکل psiphontunnel-2.0.39.aar حمل می‌کند.
+  PSIPHON_VERSION: 2.0.39
+  LYREBIRD_VERSION: lyrebird-0.6.1
+
+jobs:
+  portable:
+    name: Debug portable (x64)
+    runs-on: windows-latest
+    timeout-minutes: 75
+
+    steps:
+      # بدون `submodules: recursive` — هسته submodule نیست، در خودِ مخزن است.
+      - uses: actions/checkout@v4
+
+      # ---- دیباگ: موجودیِ مخزن ------------------------------------------
+      # اولین چیزی که در یک اجرای ناموفق لازم است: بدانیم دقیقاً چه چیزی
+      # ساخته شده. اعدادِ زیر (نسخهٔ هسته، سطحِ پچ، حضورِ فایل‌های کلیدی)
+      # همان‌هایی هستند که بعداً در لاگِ برنامه هم دیده می‌شوند.
+      - name: Debug inventory
+        shell: pwsh
+        run: |
+          Write-Host "==> core version : $(Get-Content native/aether/CORE_VERSION -ErrorAction SilentlyContinue)"
+          Write-Host "==> patch level  : $(Get-Content PATCHLEVEL -ErrorAction SilentlyContinue)"
+          Write-Host "==> node         : $(node --version)"
+          Write-Host "==> rustc        : (set after toolchain step)"
+          foreach ($p in @('native/aether/aether/src/lib.rs','src-tauri/src/state.rs','scripts/make-portable.ps1')) {
+            $ok = if (Test-Path $p) { 'present' } else { 'MISSING' }
+            Write-Host "==> $p : $ok"
+          }
+
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "Building Aether $v (debug portable, $env:ARCH)"
+
+      # ---- Toolchain -------------------------------------------------------
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: debug-${{ env.ARCH }}
+          cache-on-failure: true
+
+      # بدون `cache: npm` — آن گزینه وجود package-lock.json را اجباری می‌کند.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install frontend deps
+        run: npm install --no-audit --no-fund
+
+      # باید پیش از هر دستور cargo اجرا شود (dist-web لازم است).
+      - name: Build frontend bundle
+        run: npm run web:build
+
+      # مرتب‌سازی خودکار — هرگز بیلد را نمی‌شکند.
+      - name: Auto-format Rust sources
+        continue-on-error: true
+        working-directory: src-tauri
+        run: cargo fmt --all
+
+      # ---- سریع‌ترین نقطهٔ شکست ------------------------------------------
+      # همان گامِ fail-fast که build.yml دارد: پیش از بیلدهای گرانِ موتور،
+      # پسفون و lyrebird. یک تستِ شکسته اینجا در حدودِ سه دقیقه معلوم می‌شود،
+      # نه در دقیقهٔ چهل‌وپنج.
+      #
+      # `TAURI_CONFIG` الزامی است و همان دلیلِ build.yml را دارد: هر دستورِ
+      # cargo در این کریت `build.rs` را اجرا می‌کند و `tauri_build::build()`
+      # وجودِ تک‌تکِ مسیرهای `bundle.resources` را بررسی می‌کند — مسیرهایی که
+      # زیر dist-engine هستند و تازه بعداً ساخته می‌شوند. آرایهٔ خالی لازم
+      # است (نه شیءِ خالی): ادغامِ پیکربندی برای شیء کلید‌به‌کلید است و `{}`
+      # هیچ‌چیز را حذف نمی‌کند.
+      - name: Unit tests (engine contract parity with Android)
+        if: inputs.skip_tests != 'on'
+        working-directory: src-tauri
+        env:
+          TAURI_CONFIG: '{"bundle":{"resources":[]}}'
+        run: cargo test --target ${{ env.RUST_TARGET }}
+
+      - name: Read the app patch level
+        id: patch
+        shell: bash
+        run: |
+          level=$(tr -d '\r\n' < PATCHLEVEL)
+          if [ -z "$level" ]; then
+            echo "::error::PATCHLEVEL at the repository root is empty."
+            exit 1
+          fi
+          echo "level=$level" >> "$GITHUB_OUTPUT"
+          echo "==> app patch level: $level"
+
+      - name: Build engine (aether.exe)
+        shell: pwsh
+        env:
+          APP_PATCHLEVEL: ${{ steps.patch.outputs.level }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          ./scripts/build-engine.ps1 -Target '${{ env.RUST_TARGET }}'
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::Engine build failed. Debug workflow uses the committed core, so there is no newer/older core to roll back to - fix the core source."
+            exit 1
+          }
+
+      # موتور باید مهرِ همین مخزن را داشته باشد — همان گیتِ build.yml، با همان
+      # جست‌وجوی دوکانديده (کریتِ هسته می‌تواند زیر native/aether/aether باشد
+      # یا مستقیماً زیر native/aether؛ مسیرِ ثابتِ قبلی فقط حالتِ دوم را
+      # می‌پوشاند و همین بود که این گیت را همیشه می‌شکست).
+      - name: Engine must carry the app patch stamp
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "native/aether/aether/target/${{ env.RUST_TARGET }}",
+            "native/aether/target/${{ env.RUST_TARGET }}"
+          )
+          $exe = $null
+          foreach ($c in $candidates) {
+            if (Test-Path $c) {
+              $exe = Get-ChildItem -Recurse -Filter aether.exe -Path $c | Select-Object -First 1
+              if ($exe) { break }
+            }
+          }
+          if (-not $exe) {
+            $exe = Get-ChildItem -Recurse -Filter aether.exe -Path "native/aether" -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+          }
+          if (-not $exe) {
+            Write-Host "::error::aether.exe was not found after the engine build."
+            exit 1
+          }
+          # pwsh 7 دیگر `Select-String -Encoding Byte` را نمی‌پذیرد؛ جست‌وجو با
+          # خواندنِ مستقیمِ بایت‌ها انجام می‌شود (scripts/lib-binary-text.ps1).
+          . ./scripts/lib-binary-text.ps1
+          $want = "AETHER-BUILD-STAMP:${{ steps.patch.outputs.level }}"
+          if (-not (Test-BinaryContainsLiteral -Path $exe.FullName -Literal $want)) {
+            Write-Host "::error::$($exe.Name) does not carry '$want'."
+            $found = Find-BinaryMatches -Path $exe.FullName -Pattern 'AETHER-BUILD-STAMP:[0-9A-Za-z.\-]*'
+            if ($found) { Write-Host "  stamps actually present: $($found -join ', ')" } else { Write-Host "  (no stamp at all)" }
+            exit 1
+          }
+          Write-Host "==> engine stamp OK: $want"
+
+      - name: Fetch Wintun driver
+        shell: pwsh
+        run: ./scripts/fetch-wintun.ps1 -ArchDir '${{ env.WINTUN_DIR }}'
+
+      # ---- استیج ۲ زنجیره: psiphon-tunnel-core -------------------------
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+
+      - name: Cache the Go module + build cache (psiphon, lyrebird)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\go\pkg\mod
+            ~\AppData\Local\go-build
+          key: go1.23-debug-${{ env.ARCH }}-psiphon${{ env.PSIPHON_VERSION }}-lyrebird${{ env.LYREBIRD_VERSION }}
+          restore-keys: |
+            go1.23-debug-${{ env.ARCH }}-
+
+      - name: Build Psiphon stage (psiphon-tunnel-core.exe)
+        shell: pwsh
+        run: ./scripts/build-psiphon.ps1 -Arch '${{ env.ARCH }}' -Version '${{ env.PSIPHON_VERSION }}'
+
+      # تور و lyrebird حق شکستنِ بیلد را ندارند (همان منطقِ build.yml: یک
+      # تغییرِ بالادست در Go نباید بسته‌ای را که هر چیز دیگرش سالم است زمین
+      # بگذارد). ولی گیتِ پایین‌تر نبودشان را در payload گزارش می‌دهد.
+      - name: Stage the official Tor binaries
+        continue-on-error: true
+        shell: pwsh
+        run: ./scripts/stage-tor.ps1 -Arch '${{ env.ARCH }}'
+
+      - name: Build pluggable transport (lyrebird, for Tor bridges)
+        continue-on-error: true
+        shell: pwsh
+        run: ./scripts/build-pt.ps1 -Arch '${{ env.ARCH }}' -Version '${{ env.LYREBIRD_VERSION }}'
+
+      # ---- بیلد اپ -------------------------------------------------------
+      # `--no-bundle` درست است (`--bundles none` در CLI جدید حذف شده).
+      - name: Build Aether (Tauri, release)
+        shell: pwsh
+        run: |
+          npm run tauri -- build `
+            --target ${{ env.RUST_TARGET }} `
+            --no-bundle `
+            --config '{"version":"${{ steps.ver.outputs.version }}"}'
+
+      # Tauri خودش VERSION resource را دارد؛ فقط manifest بعد از لینک اضافه
+      # می‌شود، وگرنه winres + Tauri خطای CVT1100 می‌دهند.
+      - name: Embed and verify requireAdministrator manifest
+        shell: pwsh
+        run: |
+          $exe = "src-tauri/target/${{ env.RUST_TARGET }}/release/aether-desktop.exe"
+          if (-not (Test-Path $exe)) { throw "Release executable not found: $exe" }
+          ./scripts/embed-manifest.ps1 -ExePath $exe
+
+      - name: Stage payload
+        shell: pwsh
+        run: ./scripts/stage-payload.ps1 -Target '${{ env.RUST_TARGET }}' -Arch '${{ env.ARCH }}'
+
+      # ---- گیت‌های محتوا -------------------------------------------------
+      # در build.yml این‌ها با `github.event_name != 'pull_request'` مشروط
+      # شده‌اند؛ اینجا همیشه اجرا می‌شوند، چون هدفِ این workflow تحویلِ یک
+      # بستهٔ واقعاً قابل‌اجراست، نه فقط یک بیلدِ سبز.
+      - name: A published build must carry the pluggable transport
+        shell: pwsh
+        run: |
+          $pt = "dist/payload-${{ env.ARCH }}/engine/pt/lyrebird.exe"
+          if (-not (Test-Path $pt)) {
+            Write-Host "::error::No pluggable transport in the payload ($pt). Tor bridges would be dead. Check the 'Build pluggable transport' step's log."
+            exit 1
+          }
+          $size = (Get-Item $pt).Length
+          if ($size -lt 1MB) {
+            Write-Host "::error::$pt is only $size bytes - that is not a linked lyrebird binary."
+            exit 1
+          }
+          Write-Host "==> pluggable transport present: $pt ($([math]::Round($size/1MB,1)) MB)"
+
+      - name: A published build must carry the official tor binary
+        shell: pwsh
+        run: |
+          $tor = "dist/payload-${{ env.ARCH }}/engine/tor/tor.exe"
+          if (-not (Test-Path $tor)) {
+            Write-Host "::error::No tor binary in the payload ($tor). Check the 'Stage the official Tor binaries' step's log."
+            exit 1
+          }
+          foreach ($needed in @('lyrebird.exe','pt_config.json','geoip','geoip6')) {
+            $path = "dist/payload-${{ env.ARCH }}/engine/tor/$needed"
+            if (-not (Test-Path $path)) {
+              Write-Host "::error::$path is missing; tor cannot start without it."
+              exit 1
+            }
+          }
+          Write-Host "==> official tor present: $tor"
+
+      - name: A published payload must carry the stamped engine
+        shell: pwsh
+        run: |
+          $exe = "dist/payload-${{ env.ARCH }}/engine/aether.exe"
+          if (-not (Test-Path $exe)) {
+            Write-Host "::error::No engine in the payload ($exe)."
+            exit 1
+          }
+          . ./scripts/lib-binary-text.ps1
+          $want = "AETHER-BUILD-STAMP:${{ steps.patch.outputs.level }}"
+          if (-not (Test-BinaryContainsLiteral -Path $exe -Literal $want)) {
+            Write-Host "::error::the staged payload ships an engine that is NOT patch level ${{ steps.patch.outputs.level }}."
+            exit 1
+          }
+          Write-Host "==> payload engine stamp OK: $want"
+
+      # ---- خروجی: فقط ZIPِ پرتابل --------------------------------------
+      # نصب‌کننده (Inno Setup)، امضا و تستِ نصب عمداً حذف شده‌اند.
+      - name: Build portable ZIP
+        shell: pwsh
+        run: ./scripts/make-portable.ps1 -Arch '${{ env.ARCH }}' -Version '${{ steps.ver.outputs.version }}'
+
+      # ---- دیباگ: صورتِ حسابِ خروجی ------------------------------------
+      - name: Debug artifact listing
+        shell: pwsh
+        run: |
+          Write-Host "==> dist/"
+          Get-ChildItem dist -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host ("    {0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB)) }
+          Write-Host "==> payload tree (top level)"
+          Get-ChildItem "dist/payload-${{ env.ARCH }}" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "    $($_.Name)" }
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aether-Portable-Debug-${{ env.ARCH }}
+          path: dist/Aether-Portable-*.zip
+          if-no-files-found: error
+          retention-days: 14
