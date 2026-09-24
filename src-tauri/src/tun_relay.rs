@@ -530,6 +530,9 @@ fn poll_loop(
     stop: Arc<AtomicBool>,
 ) {
     let queue: SharedQueue = Arc::new(Mutex::new(VecDeque::new()));
+    // Replies are written straight onto the adapter (raw UDP/IP injection);
+    // keep a handle independent of the RelayDevice that smoltcp owns.
+    let inject_session = session.clone();
     let mut device = RelayDevice {
         queue: queue.clone(),
         session,
@@ -562,9 +565,6 @@ fn poll_loop(
     let mut sockets = SocketSet::new(vec![]);
     let mut tcp_sessions: Vec<TcpEntry> = Vec::new();
     let mut udp_sessions: HashMap<u16, UdpEntry> = HashMap::new();
-    // Replies are written straight onto the adapter (raw UDP/IP injection);
-    // keep a handle independent of the RelayDevice that smoltcp owns.
-    let inject_session = session.clone();
     let start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         // 1. Drain the Wintun read thread into the device queue.
@@ -800,9 +800,11 @@ fn inject_udp_packet(
 ) {
     let (IpEndpoint { addr: from_addr, port: from_port }, IpEndpoint { addr: to_addr, port: to_port }) =
         (from.clone(), to.clone());
+    // Single-variant match: the build enables proto-ipv4 only, so
+    // smoltcp's IpAddress has no Ipv6 variant to worry about (same shape
+    // as push_endpoint below).
     let (from_addr, to_addr) = match (from_addr, to_addr) {
         (IpAddress::Ipv4(a), IpAddress::Ipv4(b)) => (a, b),
-        _ => return, // IPv6 is not captured; nothing to inject for.
     };
     let total = 20 + 8 + payload.len();
     if total > mtu {
@@ -817,7 +819,11 @@ fn inject_udp_packet(
     pkt[9] = 17; // protocol: UDP
     pkt[12..16].copy_from_slice(&from_addr.octets());
     pkt[16..20].copy_from_slice(&to_addr.octets());
-    pkt[10..12].copy_from_slice(&internet_checksum(&pkt[..20]).to_be_bytes());
+    // Checksum over the header with its own field still zero — computed
+    // into a local first: the slice writes below would otherwise borrow
+    // `pkt` mutably and immutably at once.
+    let header_checksum = internet_checksum(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&header_checksum.to_be_bytes());
     // UDP header. The checksum is optional under IPv4 (RFC 768) and zero is
     // universally accepted; computing it would need the pseudo-header only.
     let udp_len = (8 + payload.len()) as u16;
