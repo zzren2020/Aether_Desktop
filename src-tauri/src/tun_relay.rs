@@ -728,7 +728,7 @@ fn spawn_tcp_bridge(
     std::thread::Builder::new()
         .name("tun-tcp-io".into())
         .spawn(move || {
-            let mut stream = match socks5_connect(socks_port, dst) {
+            let stream = match socks5_connect(socks_port, dst) {
                 Ok(s) => s,
                 Err(e) => {
                     // Evidence chain, level 3: the local smoltcp handshake
@@ -742,7 +742,7 @@ fn spawn_tcp_bridge(
                     return;
                 }
             };
-            let write_half = match stream.try_clone() {
+            let mut write_half = match stream.try_clone() {
                 Ok(h) => h,
                 Err(e) => {
                     DiagnosticsLog::w(
