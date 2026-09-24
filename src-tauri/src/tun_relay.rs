@@ -376,6 +376,12 @@ impl TxToken for RelayTxToken {
 
 struct TcpEntry {
     handle: smoltcp::iface::SocketHandle,
+    /// The application socket's own endpoint (its ephemeral source port).
+    /// Flows are keyed on (src, dst), NOT dst alone: Chrome opens several
+    /// parallel sockets to one origin, and a dst-only dedupe silently
+    /// swallowed every socket after the first (log 9-1: 69 SYNs, many
+    /// retried browser flows never got a listener).
+    src: IpEndpoint,
     dst: IpEndpoint,
     /// Poll thread → bridge writer: bytes the application sent into the
     /// tunnel. Dropping this sender is the EOF signal.
@@ -388,6 +394,14 @@ struct TcpEntry {
     /// Tunnel half-close seen: the bridge reader is gone (EOF from SOCKS5).
     socks_eof: bool,
     bridged: bool,
+    /// Data-plane observability (round 11): CONNECT OK, first-byte marks,
+    /// byte counters, stall alarm and close summaries — the previous build
+    /// could not distinguish "SOCKS5 accepted" from "SOCKS5 accepted and
+    /// then went silent" (log 9-1/9-2: 68 bridges, zero data, zero errors).
+    up: u64,
+    down: u64,
+    spawn: std::time::Instant,
+    stall_warned: bool,
 }
 
 struct UdpEntry {
@@ -522,7 +536,19 @@ fn sniff_and_seed(
                 IpAddress::Ipv4(ipv4.dst_addr()),
                 tcp.dst_port(),
             );
-            if tcp_sessions.iter().any(|t| t.dst == dst) {
+            let src = IpEndpoint::new(
+                IpAddress::Ipv4(ipv4.src_addr()),
+                tcp.src_port(),
+            );
+            // Key on (src, dst): browsers open several parallel sockets to
+            // the same origin, and every one of them needs its own listener.
+            // smoltcp handles this correctly — listeners match on the local
+            // endpoint, established sockets on the remote endpoint — but the
+            // previous dst-only dedupe starved every flow after the first.
+            if tcp_sessions
+                .iter()
+                .any(|t| t.src == src && t.dst == dst)
+            {
                 return;
             }
             let rx = TcpSocketBuffer::new(vec![0u8; 65535]);
@@ -543,12 +569,17 @@ fn sniff_and_seed(
             );
             tcp_sessions.push(TcpEntry {
                 handle,
+                src,
                 dst,
                 app_to_socks: None,
                 socks_to_app: never_recv(),
                 pending: VecDeque::new(),
                 socks_eof: false,
                 bridged: false,
+                up: 0,
+                down: 0,
+                spawn: std::time::Instant::now(),
+                stall_warned: false,
             });
         }
         smoltcp::wire::IpProtocol::Udp => {
@@ -660,6 +691,15 @@ fn pump_tcp(
             }
             let chunk = entry.pending.front_mut().expect("checked above");
             let n = sock.send_slice(chunk).unwrap_or(0);
+            if n > 0 && entry.down == 0 {
+                // Evidence chain, level 4a: the first byte ever returned by
+                // the tunnel for this flow.
+                DiagnosticsLog::i(
+                    TAG,
+                    &format!("TCP data ↓ {dst}: tunnel→app is flowing", dst = entry.dst),
+                );
+            }
+            entry.down += n as u64;
             if n == chunk.len() {
                 entry.pending.pop_front();
             } else {
@@ -679,6 +719,20 @@ fn pump_tcp(
             if n == 0 {
                 break;
             }
+            if entry.up == 0 {
+                // Evidence chain, level 4b: the first byte the application
+                // ever sent into the tunnel for this flow (TLS ClientHello
+                // or HTTP request — without this, "did the payload even
+                // leave the browser?" was unanswerable).
+                DiagnosticsLog::i(
+                    TAG,
+                    &format!(
+                        "TCP data ↑ {dst}: app→tunnel is flowing ({n} B first read)",
+                        dst = entry.dst
+                    ),
+                );
+            }
+            entry.up += n as u64;
             match entry.app_to_socks.as_ref() {
                 Some(tx) => {
                     if tx.send(buf[..n].to_vec()).is_err() {
@@ -689,6 +743,37 @@ fn pump_tcp(
                     }
                 }
                 None => break, // not bridged yet — cannot happen post-Established
+            }
+        }
+
+        // Stall alarm, level 5: a flow that CONNECTed but carried no return
+        // data for 10 s. Distinguishes "browser never sent payload" (our
+        // pump is broken) from "payload went in, nothing ever came back"
+        // (the SOCKS5 accepted and went silent — log 9-1/9-2's shape).
+        if entry.bridged
+            && !entry.stall_warned
+            && entry.spawn.elapsed() > Duration::from_secs(10)
+            && entry.down == 0
+            && sock.is_open()
+        {
+            entry.stall_warned = true;
+            if entry.up == 0 {
+                DiagnosticsLog::w(
+                    TAG,
+                    &format!(
+                        "TCP bridge to {dst}: 10 s old, ZERO data both ways — CONNECT never completed or the SOCKS5 went silent before any payload",
+                        dst = entry.dst
+                    ),
+                );
+            } else {
+                DiagnosticsLog::w(
+                    TAG,
+                    &format!(
+                        "TCP bridge to {dst}: sent {up} B into the tunnel, ZERO bytes ever came back — the exit accepted CONNECT but swallowed the payload",
+                        dst = entry.dst,
+                        up = entry.up
+                    ),
+                );
             }
         }
 
@@ -703,10 +788,35 @@ fn pump_tcp(
                 sock.close();
             }
         }
-        if entry.app_to_socks.is_none() && sock.state() == TcpState::Closed {
+        let state = sock.state();
+        if entry.app_to_socks.is_none() && state == TcpState::Closed {
+            // Close summary: the byte counters make every future round
+            // diagnosis a table lookup instead of a guessing game.
+            DiagnosticsLog::i(
+                TAG,
+                &format!(
+                    "TCP bridge to {dst} closed after {secs:.1}s: ↑{up} B ↓{down} B, final state {state:?}",
+                    dst = entry.dst,
+                    secs = entry.spawn.elapsed().as_secs_f32(),
+                    up = entry.up,
+                    down = entry.down,
+                ),
+            );
             return false; // both sides done
         }
-        let dead = entry.bridged && sock.state() == TcpState::Closed;
+        let dead = entry.bridged && state == TcpState::Closed;
+        if dead {
+            DiagnosticsLog::i(
+                TAG,
+                &format!(
+                    "TCP bridge to {dst} closed after {secs:.1}s: ↑{up} B ↓{down} B, final state {state:?}",
+                    dst = entry.dst,
+                    secs = entry.spawn.elapsed().as_secs_f32(),
+                    up = entry.up,
+                    down = entry.down,
+                ),
+            );
+        }
         !(dead)
     });
 }
@@ -739,9 +849,16 @@ fn spawn_tcp_bridge(
                         TAG,
                         &format!("TCP bridge to {dst} failed: SOCKS5 CONNECT error: {e}"),
                     );
+                    let _ = to_socks; // unblocks the poll loop's drain
                     return;
                 }
             };
+            // Evidence chain, level 3b: the exit answered 0x00. From here on
+            // a silent flow means the DATA plane, not the dial, is broken.
+            DiagnosticsLog::i(
+                TAG,
+                &format!("TCP bridge to {dst}: CONNECT OK via SOCKS5 :{socks_port}"),
+            );
             let mut write_half = match stream.try_clone() {
                 Ok(h) => h,
                 Err(e) => {
@@ -749,6 +866,7 @@ fn spawn_tcp_bridge(
                         TAG,
                         &format!("TCP bridge to {dst}: socket clone failed: {e}"),
                     );
+                    let _ = to_socks;
                     return;
                 }
             };
@@ -758,26 +876,45 @@ fn spawn_tcp_bridge(
                 .spawn(move || {
                     let mut stream = stream;
                     let mut buf = [0u8; 16384];
-                    loop {
+                    let mut total = 0u64;
+                    let outcome = loop {
                         match stream.read(&mut buf) {
-                            Ok(0) => break,
+                            Ok(0) => break format!("EOF after {total} B"),
                             Ok(n) => {
+                                total += n as u64;
                                 if from_socks.send(buf[..n].to_vec()).is_err() {
-                                    break; // app side went away
+                                    break format!("app side went away after {total} B");
                                 }
                             }
-                            Err(_) => break,
+                            Err(e) => break format!("read error after {total} B: {e}"),
                         }
-                    }
+                    };
+                    DiagnosticsLog::i(
+                        TAG,
+                        &format!("TCP bridge to {dst}: tunnel→app reader ended — {outcome}"),
+                    );
                     // Dropping `from_socks` tells the poll loop this half is
                     // over (EOF → FIN towards the application).
                 });
             // Writer half of the SAME connection: application → tunnel.
+            let mut written = 0u64;
+            let mut writer_outcome = "app closed the flow".to_string();
             for chunk in to_socks {
-                if write_half.write_all(&chunk).is_err() {
-                    break;
+                match write_half.write_all(&chunk) {
+                    Ok(()) => written += chunk.len() as u64,
+                    Err(e) => {
+                        writer_outcome =
+                            format!("write error after {written} B: {e}");
+                        break;
+                    }
                 }
             }
+            DiagnosticsLog::i(
+                TAG,
+                &format!(
+                    "TCP bridge to {dst}: app→tunnel writer ended — {writer_outcome} (wrote {written} B)"
+                ),
+            );
             // Application half-closed: dropping the write half sends a FIN
             // toward the destination while the reader keeps draining.
             drop(write_half);
@@ -926,6 +1063,60 @@ fn dns_over_tcp(query: &[u8], dst: &IpEndpoint) -> Option<Vec<u8>> {
     if query.len() < 12 || query.len() > 4096 {
         return None;
     }
+    let name = dns_qname(query);
+    let result = dns_over_tcp_inner(query, dst);
+    match &result {
+        Some(resp) => {
+            // ANCOUNT lives at bytes 6-8 of the message; strip_aaaa may have
+            // rewritten the section, so report the ORIGINAL answer count.
+            let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+            DiagnosticsLog::i(
+                TAG,
+                &format!(
+                    "DNS over TCP: {name} → {ancount} answer(s), {size} B",
+                    size = resp.len()
+                ),
+            );
+        }
+        None => DiagnosticsLog::w(
+            TAG,
+            &format!("DNS over TCP: {name} FAILED — the resolver CONNECT or reply timed out; the application will stall on this name"),
+        ),
+    }
+    result
+}
+
+/// The query's question name (labels at offset 12, no compression in the
+/// question section); used only for log readability.
+fn dns_qname(query: &[u8]) -> String {
+    let mut pos = 12usize;
+    let mut labels: Vec<&[u8]> = Vec::new();
+    while pos < query.len() {
+        let l = query[pos] as usize;
+        if l == 0 {
+            break;
+        }
+        if pos + 1 + l > query.len() || labels.len() > 8 {
+            return "<malformed>".into();
+        }
+        labels.push(&query[pos + 1..pos + 1 + l]);
+        pos += 1 + l;
+    }
+    let mut out = String::new();
+    for lab in labels {
+        if !out.is_empty() {
+            out.push('.');
+        }
+        out.push_str(&String::from_utf8_lossy(lab));
+    }
+    if out.is_empty() {
+        "<empty>".into()
+    } else {
+        out
+    }
+}
+
+fn dns_over_tcp_inner(query: &[u8], dst: &IpEndpoint) -> Option<Vec<u8>> {
     let mut stream = socks5_connect(socks_port_of(), *dst).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(4))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
@@ -941,6 +1132,9 @@ fn dns_over_tcp(query: &[u8], dst: &IpEndpoint) -> Option<Vec<u8>> {
     }
     let mut resp = vec![0u8; len];
     stream.read_exact(&mut resp).ok()?;
+    if resp.len() < 12 {
+        return None;
+    }
     // The reply came back through the tunnel; strip AAAA here too so the
     // application never sees an IPv6 answer it cannot use.
     strip_aaaa(&mut resp);
@@ -1147,8 +1341,19 @@ fn socks_request(
 fn socks5_connect(socks_port: u16, dst: IpEndpoint) -> std::io::Result<TcpStream> {
     let mut stream = TcpStream::connect(("127.0.0.1", socks_port))?;
     stream.set_nodelay(true).ok();
+    // Greeting and CONNECT must not hang forever: a SOCKS5 that accepts the
+    // TCP dial but never answers the handshake used to stall the whole
+    // bridge invisibly — "bridged" fired, zero data, zero errors, forever
+    // (the suspected shape behind log 9-1/9-2).
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
     socks_greet(&mut stream)?;
     socks_request(&mut stream, 0x01, &dst)?;
+    // Payload phase: clear the timeouts BEFORE the reader half is cloned —
+    // socket timeouts are shared between the two halves, and an idle TLS
+    // session must not be killed by the greeting window's 10 s read guard.
+    stream.set_read_timeout(None).ok();
+    stream.set_write_timeout(None).ok();
     Ok(stream)
 }
 
