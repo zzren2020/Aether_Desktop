@@ -55,10 +55,6 @@ use std::os::windows::process::CommandExt;
 use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState};
-use smoltcp::socket::udp::{
-    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
-    UdpMetadata,
-};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{
     HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, TcpPacket,
@@ -69,7 +65,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket as StdUdpSocke
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TAG: &str = "tun_relay";
 
@@ -112,6 +108,9 @@ const ENGINE_PREFIXES_V4: [&str; 15] = [
 pub struct RelayHandle {
     stop: Arc<AtomicBool>,
     routes_added: Vec<(String, String)>,
+    /// The NRPT catch-all rule was put in place by this handle and must go
+    /// when the data path goes.
+    nrpt_installed: bool,
     _poll_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -123,6 +122,9 @@ impl RelayHandle {
         // a machine loses its internet after a disconnect.
         for (dest, mask) in &self.routes_added {
             route_delete(dest, mask);
+        }
+        if self.nrpt_installed {
+            nrpt_remove();
         }
         DiagnosticsLog::i(TAG, "TUN data path removed — default routes released.");
         // The poll thread checks `stop` every tick; the Wintun read thread
@@ -176,6 +178,41 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
         ),
     );
 
+    // DNS must ride the tunnel — name resolution is where the GFW bites
+    // first. Windows resolves via ALL adapters' DNS servers in parallel and
+    // uses the first answer ("Smart Multi-Homed Name Resolution"), so the
+    // physical adapter's resolver — faster than the tunnel and, behind the
+    // GFW, poisoned — would keep winning (log 10-1: not ONE DNS query
+    // reached the relay; the TLS alerts to google IPs were the fingerprint
+    // of poisoned answers). The NRPT catch-all policy forces EVERY name to
+    // the tunnel resolver 1.1.1.1, which rides 0.0.0.0/1 into the adapter
+    // and is answered by our DNS-over-TCP relay.
+    let mut nrpt_installed = false;
+    match nrpt_install() {
+        Ok(true) => {
+            nrpt_installed = true;
+            DiagnosticsLog::i(
+                TAG,
+                "NRPT catch-all installed: every DNS name now resolves via 1.1.1.1 through the tunnel.",
+            );
+        }
+        Ok(false) => {
+            // A rule with our comment is already there (crashed previous
+            // session): still ours to remove at shutdown.
+            nrpt_installed = true;
+            DiagnosticsLog::i(TAG, "NRPT catch-all already present — reusing it.");
+        }
+        Err(e) => DiagnosticsLog::w(
+            TAG,
+            &format!(
+                "NRPT install failed: {e} — DNS will race the physical adapter's resolver and may come back poisoned."
+            ),
+        ),
+    }
+    // Poisoned answers cached before the connect would otherwise survive
+    // until their (often long) TTL expires.
+    flush_dns_cache();
+
     let stop = Arc::new(AtomicBool::new(false));
     let (pkt_tx, pkt_rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
@@ -222,6 +259,7 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
     Ok(RelayHandle {
         stop,
         routes_added,
+        nrpt_installed,
         _poll_thread: poll_thread,
     })
 }
@@ -290,6 +328,75 @@ fn default_gateway() -> Result<Ipv4Addr> {
         }
     }
     Err(anyhow!("no active 0.0.0.0/0 row in route print"))
+}
+
+// ---------------------------------------------------------------------------
+// DNS policy (NRPT) and resolver hygiene
+// ---------------------------------------------------------------------------
+
+/// Comment tagging every NRPT rule this module created, so shutdown removes
+/// only ours even if the user has rules from other VPN software.
+const NRPT_COMMENT: &str = "AetherTunDns";
+
+fn run_powershell(script: &str) -> Result<String> {
+    let out = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .context("powershell failed to execute")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "powershell exit {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Idempotent NRPT catch-all ("." = every name → the tunnel resolver).
+/// Ok(true) = rule installed now; Ok(false) = a rule with our comment was
+/// already present (crashed previous session — still ours to remove).
+fn nrpt_install() -> Result<bool> {
+    let script = format!(
+        "$r = Get-DnsClientNrptRule | Where-Object Comment -eq '{comment}'; \
+         if ($r) {{ Write-Output 'present' }} \
+         else {{ Add-DnsClientNrptRule -Namespace '.' -NameServers '{dns}' -Comment '{comment}' -ErrorAction Stop | Out-Null; Write-Output 'installed' }}",
+        comment = NRPT_COMMENT,
+        dns = crate::tun::TUN_DNS_V4,
+    );
+    Ok(run_powershell(&script)?.contains("installed"))
+}
+
+fn nrpt_remove() {
+    let script = format!(
+        "Get-DnsClientNrptRule | Where-Object Comment -eq '{comment}' | Remove-DnsClientNrptRule -Force",
+        comment = NRPT_COMMENT
+    );
+    if let Err(e) = run_powershell(&script) {
+        DiagnosticsLog::w(
+            TAG,
+            &format!(
+                "NRPT rule removal failed: {e} — remove the '{NRPT_COMMENT}' rule manually if it lingers."
+            ),
+        );
+    }
+}
+
+/// Drop cached answers that were resolved through the physical adapter
+/// before the connect — poisoned entries otherwise survive their TTL.
+fn flush_dns_cache() {
+    let _ = std::process::Command::new("ipconfig")
+        .args(["/flushdns"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
 }
 
 // ---------------------------------------------------------------------------
@@ -405,12 +512,14 @@ struct TcpEntry {
 }
 
 struct UdpEntry {
-    handle: smoltcp::iface::SocketHandle,
-    /// Poll thread → relay thread: datagrams the application sent (dst kept).
+    /// The application's own endpoint (source of its datagrams). Replies are
+    /// injected back TO this endpoint.
+    src: IpEndpoint,
+    /// Poll thread → relay thread: (payload, original destination).
     to_relay: Sender<(Vec<u8>, IpEndpoint)>,
-    /// Relay thread → poll thread: datagrams that came back (src kept).
+    /// Relay thread → poll thread: (payload, source the reply claims).
     from_relay: Receiver<(Vec<u8>, IpEndpoint)>,
-    last_seen: std::time::Instant,
+    last_seen: Instant,
 }
 
 fn poll_loop(
@@ -453,7 +562,10 @@ fn poll_loop(
     let mut sockets = SocketSet::new(vec![]);
     let mut tcp_sessions: Vec<TcpEntry> = Vec::new();
     let mut udp_sessions: HashMap<u16, UdpEntry> = HashMap::new();
-    let start = std::time::Instant::now();
+    // Replies are written straight onto the adapter (raw UDP/IP injection);
+    // keep a handle independent of the RelayDevice that smoltcp owns.
+    let inject_session = session.clone();
+    let start = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         // 1. Drain the Wintun read thread into the device queue.
         {
@@ -466,17 +578,38 @@ fn poll_loop(
             }
         }
 
-        // 2. Peek the queue and create sockets for new flows BEFORE the poll:
-        //    smoltcp drops a TCP SYN it has no listening socket for, and a
-        //    UDP datagram with no bound port. Sniffing here is what makes the
-        //    "connect to any address" model work.
-        {
-            let q = match queue.lock() {
+        // 2. Split the batch BEFORE smoltcp sees it:
+        //    * TCP packets stay in the queue for smoltcp (with listeners
+        //      seeded for new flows first — smoltcp drops a SYN that has no
+        //      listening socket);
+        //    * UDP datagrams are taken OUT and handled raw. smoltcp's UDP
+        //      sockets match on the DESTINATION port (udp.rs accepts():
+        //      `self.endpoint.port != repr.dst_port → reject`), so a socket
+        //      bound to the application's source port can never receive the
+        //      application's datagrams — every query that entered the tunnel
+        //      was silently dropped (log 10-1: 69 UDP sessions opened, zero
+        //      DNS queries relayed, zero DNS-over-TCP logs). Raw handling is
+        //      what tun2socks does; smoltcp sockets are TCP-only here now.
+        let incoming: Vec<Vec<u8>> = {
+            let mut q = match queue.lock() {
                 Ok(q) => q,
                 Err(_) => break,
             };
-            for pkt in q.iter() {
-                sniff_and_seed(pkt, &mut sockets, &mut tcp_sessions, &mut udp_sessions);
+            std::mem::take(&mut *q)
+        };
+        for pkt in &incoming {
+            sniff_and_seed(pkt, &mut sockets, &mut tcp_sessions);
+        }
+        for pkt in incoming {
+            if parse_udp_datagram(&pkt).is_some() {
+                sniff_udp_datagram(&pkt, &mut udp_sessions);
+            } else {
+                // Non-UDP (TCP payload, ICMP, …) — smoltcp's business.
+                let mut q = match queue.lock() {
+                    Ok(q) => q,
+                    Err(_) => break,
+                };
+                q.push_back(pkt);
             }
         }
 
@@ -487,8 +620,8 @@ fn poll_loop(
         // 4. Pump the TCP bridges.
         pump_tcp(&mut iface, &mut sockets, &mut tcp_sessions, socks_port);
 
-        // 5. Pump the UDP relays.
-        pump_udp(&mut iface, &mut sockets, &mut udp_sessions);
+        // 5. Pump the UDP relays (reply injection straight to the adapter).
+        pump_udp(&inject_session, mtu as usize, &mut udp_sessions);
 
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -505,132 +638,83 @@ fn poll_loop(
     DiagnosticsLog::i(TAG, "TUN relay poll loop stopped.");
 }
 
-/// Inspect a raw IP packet and, for a flow we have not seen yet, create the
-/// socket that will make smoltcp accept it:
-///   * TCP SYN (not SYN+ACK): listen socket bound to the ORIGINAL DESTINATION
-///     — any_ip makes smoltcp accept packets addressed to foreign hosts, and
-///     the listen endpoint selects which socket owns the flow.
-///   * UDP: bind a socket to the SOURCE port (0.0.0.0:src), so replies can be
-///     routed back to the same application socket.
+/// Inspect a raw IP packet and, for a TCP flow we have not seen yet, create
+/// the socket that will make smoltcp accept it:
+/// a TCP SYN (not SYN+ACK) gets a listen socket bound to the ORIGINAL
+/// DESTINATION — any_ip makes smoltcp accept packets addressed to foreign
+/// hosts, and the listen endpoint selects which socket owns the flow.
+/// UDP is NOT handled here: smoltcp's UDP sockets match on the destination
+/// port and could never deliver the application's datagrams (see the
+/// poll-loop comment); `sniff_udp_datagram` handles UDP raw.
 fn sniff_and_seed(
     pkt: &[u8],
     sockets: &mut SocketSet,
     tcp_sessions: &mut Vec<TcpEntry>,
-    udp_sessions: &mut HashMap<u16, UdpEntry>,
 ) {
     let Some(ipv4) = Ipv4Packet::new_checked(pkt).ok() else {
         return; // IPv6 is not captured (routes are v4-only); fragments and non-IP are ignored.
     };
     // smoltcp 0.12: the IPv4 protocol field getter is `next_header()`.
-    match ipv4.next_header() {
-        smoltcp::wire::IpProtocol::Tcp => {
-            let Ok(tcp) = TcpPacket::new_checked(ipv4.payload()) else {
-                return;
-            };
-            // smoltcp 0.12: flag getters are `syn()` / `ack()`.
-            let is_syn = tcp.syn() && !tcp.ack();
-            if !is_syn {
-                return;
-            }
-            let dst = IpEndpoint::new(
-                IpAddress::Ipv4(ipv4.dst_addr()),
-                tcp.dst_port(),
-            );
-            let src = IpEndpoint::new(
-                IpAddress::Ipv4(ipv4.src_addr()),
-                tcp.src_port(),
-            );
-            // Key on (src, dst): browsers open several parallel sockets to
-            // the same origin, and every one of them needs its own listener.
-            // smoltcp handles this correctly — listeners match on the local
-            // endpoint, established sockets on the remote endpoint — but the
-            // previous dst-only dedupe starved every flow after the first.
-            if tcp_sessions
-                .iter()
-                .any(|t| t.src == src && t.dst == dst)
-            {
-                return;
-            }
-            let rx = TcpSocketBuffer::new(vec![0u8; 65535]);
-            let tx = TcpSocketBuffer::new(vec![0u8; 65535]);
-            let mut sock = TcpSocket::new(rx, tx);
-            if sock.listen(dst).is_err() {
-                return;
-            }
-            let handle = sockets.add(sock);
-            // Evidence chain, level 1 of 2: the SYN reached the stack and a
-            // listener now owns the flow. (Level 2 is "TCP through tunnel"
-            // once the smoltcp handshake completes and the bridge spawns —
-            // if this line appears without that one, the handshake itself
-            // is failing inside smoltcp.)
-            DiagnosticsLog::i(
-                TAG,
-                &format!("TCP SYN seen → accepting connection to {dst}"),
-            );
-            tcp_sessions.push(TcpEntry {
-                handle,
-                src,
-                dst,
-                app_to_socks: None,
-                socks_to_app: never_recv(),
-                pending: VecDeque::new(),
-                socks_eof: false,
-                bridged: false,
-                up: 0,
-                down: 0,
-                spawn: std::time::Instant::now(),
-                stall_warned: false,
-            });
-        }
-        smoltcp::wire::IpProtocol::Udp => {
-            let Some(src_port) = udp_src_port(ipv4.payload()) else {
-                return;
-            };
-            if udp_sessions.contains_key(&src_port) {
-                return;
-            }
-            // NBNS (137), mDNS (5353), SSDP and friends are broadcast/multicast
-            // by nature — they must never leave the machine, and seeding a
-            // relay session for them only produces noise (log 6-3: dozens of
-            // idle sessions expiring).
-            let dst = ipv4.dst_addr();
-            if dst.is_broadcast() || dst.is_multicast() || dst.is_unspecified() {
-                return;
-            }
-            let rx = UdpPacketBuffer::new(
-                vec![UdpPacketMetadata::EMPTY; 64],
-                vec![0u8; 65535],
-            );
-            let tx = UdpPacketBuffer::new(
-                vec![UdpPacketMetadata::EMPTY; 64],
-                vec![0u8; 65535],
-            );
-            let mut sock = UdpSocket::new(rx, tx);
-            // From<u16> for IpListenEndpoint = "this local port, any address"
-            // — exactly the wildcard bind the source-port routing needs.
-            if sock.bind(src_port).is_err() {
-                return;
-            }
-            let handle = sockets.add(sock);
-            let (to_relay_tx, to_relay_rx) = std::sync::mpsc::channel::<(Vec<u8>, IpEndpoint)>();
-            let (from_relay_tx, from_relay_rx) = std::sync::mpsc::channel::<(Vec<u8>, IpEndpoint)>();
-            udp_sessions.insert(
-                src_port,
-                UdpEntry {
-                    handle,
-                    to_relay: to_relay_tx,
-                    from_relay: from_relay_rx,
-                    last_seen: std::time::Instant::now(),
-                },
-            );
-            spawn_udp_relay(src_port, to_relay_rx, from_relay_tx);
-            DiagnosticsLog::i(
-                TAG,
-                &format!("UDP session opened on source port {src_port}"),
-            );
-        }
-        _ => {}
+    if ipv4.next_header() != smoltcp::wire::IpProtocol::Tcp {
+        return;
     }
+    let Ok(tcp) = TcpPacket::new_checked(ipv4.payload()) else {
+        return;
+    };
+    // smoltcp 0.12: flag getters are `syn()` / `ack()`.
+    let is_syn = tcp.syn() && !tcp.ack();
+    if !is_syn {
+        return;
+    }
+    let dst = IpEndpoint::new(
+        IpAddress::Ipv4(ipv4.dst_addr()),
+        tcp.dst_port(),
+    );
+    let src = IpEndpoint::new(
+        IpAddress::Ipv4(ipv4.src_addr()),
+        tcp.src_port(),
+    );
+    // Key on (src, dst): browsers open several parallel sockets to
+    // the same origin, and every one of them needs its own listener.
+    // smoltcp handles this correctly — listeners match on the local
+    // endpoint, established sockets on the remote endpoint — but the
+    // previous dst-only dedupe starved every flow after the first.
+    if tcp_sessions
+        .iter()
+        .any(|t| t.src == src && t.dst == dst)
+    {
+        return;
+    }
+    let rx = TcpSocketBuffer::new(vec![0u8; 65535]);
+    let tx = TcpSocketBuffer::new(vec![0u8; 65535]);
+    let mut sock = TcpSocket::new(rx, tx);
+    if sock.listen(dst).is_err() {
+        return;
+    }
+    let handle = sockets.add(sock);
+    // Evidence chain, level 1 of 2: the SYN reached the stack and a
+    // listener now owns the flow. (Level 2 is "TCP through tunnel"
+    // once the smoltcp handshake completes and the bridge spawns —
+    // if this line appears without that one, the handshake itself
+    // is failing inside smoltcp.)
+    DiagnosticsLog::i(
+        TAG,
+        &format!("TCP SYN seen → accepting connection to {dst}"),
+    );
+    tcp_sessions.push(TcpEntry {
+        handle,
+        src,
+        dst,
+        app_to_socks: None,
+        socks_to_app: never_recv(),
+        pending: VecDeque::new(),
+        socks_eof: false,
+        bridged: false,
+        up: 0,
+        down: 0,
+        spawn: std::time::Instant::now(),
+        stall_warned: false,
+    });
 }
 
 fn never_recv() -> Receiver<Vec<u8>> {
@@ -641,11 +725,124 @@ fn never_recv() -> Receiver<Vec<u8>> {
     rx
 }
 
-fn udp_src_port(payload: &[u8]) -> Option<u16> {
-    if payload.len() < 8 {
+/// Parse a raw IPv4 UDP datagram: (source endpoint, destination endpoint,
+/// payload). Used instead of smoltcp UDP sockets — see the poll-loop comment.
+fn parse_udp_datagram(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint, &[u8])> {
+    let ipv4 = Ipv4Packet::new_checked(pkt).ok()?;
+    if ipv4.next_header() != smoltcp::wire::IpProtocol::Udp {
         return None;
     }
-    Some(u16::from_be_bytes([payload[0], payload[1]]))
+    let udp = ipv4.payload();
+    if udp.len() < 8 {
+        return None;
+    }
+    let sport = u16::from_be_bytes([udp[0], udp[1]]);
+    let dport = u16::from_be_bytes([udp[2], udp[3]]);
+    let ulen = u16::from_be_bytes([udp[4], udp[5]]) as usize;
+    // NBNS (137), mDNS (5353), SSDP and friends are broadcast/multicast by
+    // nature — they must never leave the machine (log 6-3).
+    let dst_addr = ipv4.dst_addr();
+    if dst_addr.is_broadcast() || dst_addr.is_multicast() || dst_addr.is_unspecified() {
+        return None;
+    }
+    if sport == 0 || dport == 0 {
+        return None;
+    }
+    // Honour the UDP length field; fall back to the IP payload length if the
+    // datagram was padded.
+    let data_len = ulen.saturating_sub(8).min(udp.len() - 8);
+    Some((
+        IpEndpoint::new(IpAddress::Ipv4(ipv4.src_addr()), sport),
+        IpEndpoint::new(IpAddress::Ipv4(dst_addr), dport),
+        &udp[8..8 + data_len],
+    ))
+}
+
+/// Route one raw application datagram into its UDP relay session. The poll
+/// loop calls this for every unicast UDP packet the adapter produced.
+fn sniff_udp_datagram(pkt: &[u8], sessions: &mut HashMap<u16, UdpEntry>) {
+    let Some((src, dst, payload)) = parse_udp_datagram(pkt) else {
+        return;
+    };
+    let entry = sessions.entry(src.port).or_insert_with(|| {
+        let (to_relay_tx, to_relay_rx) = std::sync::mpsc::channel::<(Vec<u8>, IpEndpoint)>();
+        let (from_relay_tx, from_relay_rx) = std::sync::mpsc::channel::<(Vec<u8>, IpEndpoint)>();
+        spawn_udp_relay(src.port, to_relay_rx, from_relay_tx);
+        DiagnosticsLog::i(
+            TAG,
+            &format!("UDP session opened: {src} → {dst}"),
+        );
+        UdpEntry {
+            src,
+            to_relay: to_relay_tx,
+            from_relay: from_relay_rx,
+            last_seen: Instant::now(),
+        }
+    });
+    entry.last_seen = Instant::now();
+    // The relay uses the PER-DATAGRAM destination, so one session can serve
+    // several destinations; each reply is injected with the matching source.
+    let _ = entry.to_relay.send((payload.to_vec(), dst));
+}
+
+/// Build a raw IPv4+UDP packet (`from` ⇐ payload, delivered to `to`) and
+/// write it onto the adapter. This is how tunnel replies reach the
+/// application: the datagram must look like it came from the endpoint the
+/// application originally sent to (e.g. the resolver 1.1.1.1:53).
+fn inject_udp_packet(
+    session: &wintun::Session,
+    mtu: usize,
+    from: &IpEndpoint,
+    to: &IpEndpoint,
+    payload: &[u8],
+) {
+    let (IpEndpoint { addr: from_addr, port: from_port }, IpEndpoint { addr: to_addr, port: to_port }) =
+        (from.clone(), to.clone());
+    let (from_addr, to_addr) = match (from_addr, to_addr) {
+        (IpAddress::Ipv4(a), IpAddress::Ipv4(b)) => (a, b),
+        _ => return, // IPv6 is not captured; nothing to inject for.
+    };
+    let total = 20 + 8 + payload.len();
+    if total > mtu {
+        return; // cannot fit the adapter MTU; DNS replies always fit
+    }
+    let mut pkt = vec![0u8; total];
+    // IPv4 header (no options).
+    pkt[0] = 0x45; // version 4, IHL 5
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes()); // total length
+    pkt[6..8].copy_from_slice(&0u16.to_be_bytes()); // no flags, no offset
+    pkt[8] = 64; // TTL
+    pkt[9] = 17; // protocol: UDP
+    pkt[12..16].copy_from_slice(&from_addr.octets());
+    pkt[16..20].copy_from_slice(&to_addr.octets());
+    pkt[10..12].copy_from_slice(&internet_checksum(&pkt[..20]).to_be_bytes());
+    // UDP header. The checksum is optional under IPv4 (RFC 768) and zero is
+    // universally accepted; computing it would need the pseudo-header only.
+    let udp_len = (8 + payload.len()) as u16;
+    pkt[20..22].copy_from_slice(&from_port.to_be_bytes());
+    pkt[22..24].copy_from_slice(&to_port.to_be_bytes());
+    pkt[24..26].copy_from_slice(&udp_len.to_be_bytes());
+    pkt[28..].copy_from_slice(payload);
+    if let Ok(mut p) = session.allocate_send_packet(total as u16) {
+        p.bytes_mut().copy_from_slice(&pkt);
+        session.send_packet(p);
+    }
+}
+
+/// RFC 1071 internet checksum over a header with the checksum field zeroed.
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    for pair in data.chunks(2) {
+        let word = match pair.len() {
+            2 => u16::from_be_bytes([pair[0], pair[1]]) as u32,
+            _ => (pair[0] as u32) << 8, // odd byte, padded with zero
+        };
+        sum += word;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,59 +1380,30 @@ fn parse_socks_udp(data: &[u8]) -> Option<(IpEndpoint, &[u8])> {
     Some((IpEndpoint::new(addr, port), &rest[2..]))
 }
 
-/// Drive every UDP session: datagrams that arrived on the adapter go to the
-/// relay thread, datagrams that came back from the tunnel go onto the
-/// adapter with the original source endpoint. Idle sessions expire.
+/// Drive every UDP session's RETURN path: the application's datagrams were
+/// already handed to the relay threads at sniff time (`sniff_udp_datagram`),
+/// so all that is left here is injecting tunnel replies onto the adapter and
+/// expiring idle sessions. Idle sessions expire.
 fn pump_udp(
-    _iface: &mut Interface,
-    sockets: &mut SocketSet,
+    session: &wintun::Session,
+    mtu: usize,
     sessions: &mut HashMap<u16, UdpEntry>,
 ) {
-    // smoltcp 0.12: UdpSocket::recv_slice/send_slice take no Context — the
-    // socket carries its own send metadata (UdpMetadata) per datagram.
-    let now = std::time::Instant::now();
+    let now = Instant::now();
     let mut expired: Vec<u16> = Vec::new();
     for (src_port, entry) in sessions.iter_mut() {
-        let sock = sockets.get_mut::<UdpSocket>(entry.handle);
-
-        // Application → tunnel.
-        loop {
-            let mut buf = [0u8; 65535];
-            match sock.recv_slice(&mut buf) {
-                Ok((n, meta)) => {
-                    entry.last_seen = now;
-                    let dst = meta.endpoint; // the remote the app was sending to
-                    if entry
-                        .to_relay
-                        .send((buf[..n].to_vec(), dst))
-                        .is_err()
-                    {
-                        // relay died (SOCKS5 UDP refused) — nothing to serve
-                        sock.close();
-                        break;
-                    }
-                }
-                Err(smoltcp::socket::udp::RecvError::Exhausted) => break,
-                Err(_) => break,
-            }
-        }
-
-        // Tunnel → application.
+        // Tunnel → application: inject the reply as a raw UDP/IP datagram
+        // spoofing the endpoint the application originally talked to.
         loop {
             match entry.from_relay.try_recv() {
-                Ok((data, src)) => {
+                Ok((data, from)) => {
                     entry.last_seen = now;
-                    // Sending "to" the original remote endpoint is what
-                    // delivers the datagram to the application's socket: from
-                    // the app's point of view the reply came from there.
-                    let meta: UdpMetadata = src.into();
-                    let _ = sock.send_slice(&data, meta);
+                    inject_udp_packet(session, mtu, &from, &entry.src, &data);
                 }
                 Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    sock.close();
-                    break;
-                }
+                // The relay thread is gone with the session teardown; the
+                // entry itself is reaped by the idle expiry below.
+                Err(TryRecvError::Disconnected) => break,
             }
         }
 
@@ -1244,10 +1412,7 @@ fn pump_udp(
         }
     }
     for port in expired {
-        if let Some(entry) = sessions.remove(&port) {
-            let sock = sockets.get_mut::<UdpSocket>(entry.handle);
-            sock.close();
-        }
+        sessions.remove(&port);
         DiagnosticsLog::i(TAG, &format!("UDP session on source port {port} expired (idle 90 s)."));
     }
 }
