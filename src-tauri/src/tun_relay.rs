@@ -384,14 +384,35 @@ fn default_gateway() -> Result<Ipv4Addr> {
 // ---------------------------------------------------------------------------
 
 /// True iff both halves of the catch-all route exist AND point at the TUN
-/// address. Get-NetRoute prints the NextHop of every matching route; we need
-/// at least two rows equal to the TUN address.
+/// address.
+///
+/// >>> AETHER-APP-FIX route-verify
+/// Parsed from `route print -4`, NOT Get-NetRoute: the CIM cmdlets read a
+/// WMI repository that lags the live table — log 13-1/13-3 saw both halves
+/// "missing" 0.9 s and 1.7 s after a route add that was demonstrably working
+/// (SYNs were already flowing through the adapter). Plain `route print` is
+/// the same source `default_gateway()` has been parsing reliably all along,
+/// reads the live table, and starts instantly (no PowerShell cold start).
 fn verify_catchall_routes(tun_gw: &str) -> bool {
-    let script = "Get-NetRoute -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop";
-    match run_powershell(script) {
-        Ok(out) => out.lines().filter(|l| l.trim() == tun_gw).count() >= 2,
-        Err(_) => false,
-    }
+    let out = std::process::Command::new("route")
+        .args(["print", "-4"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    let out = match out {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let want = [("0.0.0.0", "128.0.0.0"), ("128.0.0.0", "128.0.0.0")];
+    want.iter().all(|(dest, mask)| {
+        // Active-route row: NetworkDestination Netmask Gateway Interface Metric.
+        // The dest/mask pair also keeps us out of the persistent-routes and
+        // header sections, whose columns mean something else.
+        text.lines().any(|line| {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            cols.len() >= 5 && cols[0] == *dest && cols[1] == *mask && cols[2] == tun_gw
+        })
+    })
 }
 // <<< AETHER-APP-FIX
 
@@ -1678,7 +1699,14 @@ fn socks_request(
 /// while to open". Each flow already runs in a dedicated thread with the
 /// client's socket buffered in smoltcp, so holding the dial through the gap
 /// costs nothing and converts the blackhole into a wait.
-const SOCKS_REFUSED_RETRY_WINDOW: Duration = Duration::from_secs(20);
+///
+/// Log 13-2 raised the stakes: the engine can lose its tunnels MID-session
+/// (both WireGuard endpoints failed twice → two verify-timeout reconnect
+/// cycles) and need ~45 s before 1819 listens again — the 20 s window then
+/// ran out on a batch of flows and the user still waited "a minute or so"
+/// on browser retries. 75 s matches the launcher's own attempt budget, so
+/// a flow held here outlives any single engine re-establishment.
+const SOCKS_REFUSED_RETRY_WINDOW: Duration = Duration::from_secs(75);
 const SOCKS_REFUSED_RETRY_STEP: Duration = Duration::from_millis(500);
 
 fn tcp_connect_socks(socks_port: u16) -> std::io::Result<TcpStream> {
