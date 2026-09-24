@@ -595,7 +595,9 @@ fn poll_loop(
                 Ok(q) => q,
                 Err(_) => break,
             };
-            std::mem::take(&mut *q)
+            // The queue is a VecDeque; flatten this tick's batch to a Vec so
+            // the UDP/TCP partition below can consume it.
+            std::mem::take(&mut *q).into()
         };
         for pkt in &incoming {
             sniff_and_seed(pkt, &mut sockets, &mut tcp_sessions);
@@ -790,7 +792,7 @@ fn sniff_udp_datagram(pkt: &[u8], sessions: &mut HashMap<u16, UdpEntry>) {
 /// application: the datagram must look like it came from the endpoint the
 /// application originally sent to (e.g. the resolver 1.1.1.1:53).
 fn inject_udp_packet(
-    session: &wintun::Session,
+    session: &Arc<wintun::Session>,
     mtu: usize,
     from: &IpEndpoint,
     to: &IpEndpoint,
@@ -1385,7 +1387,7 @@ fn parse_socks_udp(data: &[u8]) -> Option<(IpEndpoint, &[u8])> {
 /// so all that is left here is injecting tunnel replies onto the adapter and
 /// expiring idle sessions. Idle sessions expire.
 fn pump_udp(
-    session: &wintun::Session,
+    session: &Arc<wintun::Session>,
     mtu: usize,
     sessions: &mut HashMap<u16, UdpEntry>,
 ) {
