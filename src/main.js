@@ -8,14 +8,17 @@ import { getCurrentWindow } from '@tauri-apps/api/window'
 
 import { renderHome } from './views/home.js'
 import { renderSettings } from './views/settings.js'
-import { renderAssistant } from './views/assistant.js'
-import { renderChat } from './views/chat.js'
 import { renderDiagnostics } from './views/diagnostics.js'
 import { renderShare } from './views/share.js'
 import { renderAbout } from './views/about.js'
 
 import { t, applyLang } from './i18n.js'
-import { initAi } from './ai.js'
+// >>> AETHER-APP-FIX remove-assistant-chat
+// 助手（assistant）与聊天（chat）两个界面连同 AI 层入口一并下线：
+// 视图文件（views/assistant.js、views/chat.js、ai.js）仍留在源码树里作死代码，
+// 但没有任何导航入口指向它们。恢复时把下面三处 import、NAV_ICONS/VIEWS/
+// NAV_LABELS 里的条目和 index.html 的两个 rail 按钮加回来即可。
+// <<< AETHER-APP-FIX
 import { setTabRouter } from './ui/nav.js'
 
 // --- وضعیت سراسری ------------------------------------------------------
@@ -169,8 +172,7 @@ const ICON_CLOSE =
 const NAV_ICONS = {
   home: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5.5 9.5V20h13V9.5"/></svg>',
   advanced: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h8M18 7h2M4 17h2M10 17h10"/><circle cx="15" cy="7" r="2.4"/><circle cx="7" cy="17" r="2.4"/></svg>',
-  assistant: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path d="M12 3.2l2 5.4 5.4 2-5.4 2-2 5.4-2-5.4-5.4-2 5.4-2z" fill="currentColor"/><path d="M18.7 15.3l.7 2 2 .7-2 .7-.7 2-.7-2-2-.7 2-.7z" fill="currentColor" opacity=".6"/></svg>',
-  chat: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6.5A2.5 2.5 0 0 1 6.5 4h11A2.5 2.5 0 0 1 20 6.5v7a2.5 2.5 0 0 1-2.5 2.5H9.5L5 20v-4"/><path d="M8.5 10h7"/><path d="M8.5 13h4"/></svg>',
+  // >>> AETHER-APP-FIX remove-assistant-chat：assistant/chat 图标随界面一并下线
   diagnostics: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2.5-6 5 12 2.5-6h4"/></svg>',
   share: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4.5 12a10.5 10.5 0 0 1 15 0"/><path d="M7.8 15.2a6 6 0 0 1 8.4 0"/><circle cx="12" cy="18.6" r="1.5" fill="currentColor" stroke="none"/></svg>',
   about: '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5"/><circle cx="12" cy="7.8" r="1" fill="currentColor" stroke="none"/></svg>',
@@ -222,8 +224,7 @@ function wireTitlebar() {
 const VIEWS = {
   home: renderHome,
   advanced: renderSettings,
-  assistant: renderAssistant,
-  chat: renderChat,
+  // >>> AETHER-APP-FIX remove-assistant-chat：assistant/chat 视图不再注册
   diagnostics: renderDiagnostics,
   share: renderShare,
   about: renderAbout,
@@ -343,7 +344,8 @@ function wireRail() {
 }
 
 // --- راه‌اندازی ---------------------------------------------------------
-const NAV_LABELS = { home: 'Home', advanced: 'Settings', assistant: 'Assistant', chat: 'Chat', diagnostics: 'Diagnostics', share: 'Share over LAN', about: 'About' }
+// >>> AETHER-APP-FIX remove-assistant-chat：标签表同步去掉 assistant/chat
+const NAV_LABELS = { home: 'Home', advanced: 'Settings', diagnostics: 'Diagnostics', share: 'Share over LAN', about: 'About' }
 
 // v9: retranslate the chrome (nav rail icons + labels + window title) for the
 // active language. The rail is a permanent Material-style navigation rail.
@@ -417,10 +419,8 @@ async function boot() {
     emit()
   })
 
-  // جریان وضعیت هوش مصنوعی. عمداً `await` نمی‌شود و در `Promise.all` بالا هم
-  // نیست: صفحهٔ خانه به آن نیازی ندارد و انتظار برایش اولین رنگ‌آمیزی را عقب
-  // می‌انداخت. صفحهٔ دستیار به‌محض رسیدن اولین snapshot خودش را می‌سازد.
-  initAi().catch((error) => console.error('AI layer unavailable', error))
+  // >>> AETHER-APP-FIX remove-assistant-chat：AI 层入口随助手/聊天一并下线
+  // （原 initAi() 调用与"AI 状态流"注释一并移除——页面没有消费方了。）
 
   // Repaint the already-visible shell with the real state once IPC returns.
   renderTab()

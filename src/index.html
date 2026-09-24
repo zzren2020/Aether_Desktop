@@ -6,7 +6,7 @@
   <title>Aether</title>
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/app.css" />
-  <link rel="stylesheet" href="styles/chat.css" />
+  <!-- AETHER-APP-FIX remove-assistant-chat：styles/chat.css 仅服务聊天页，随界面下线 -->
   <link rel="stylesheet" href="styles/desktop.css" />
 </head>
 <body>
@@ -27,8 +27,7 @@
     <nav class="rail" id="nav-rail" aria-label="Sections">
       <button class="rail__item is-active" data-tab="home">Home</button>
       <button class="rail__item" data-tab="advanced">Advanced</button>
-      <button class="rail__item" data-tab="assistant">Assistant</button>
-      <button class="rail__item" data-tab="chat">Chat</button>
+      <!-- AETHER-APP-FIX remove-assistant-chat：助手与聊天入口已按需求下线 -->
       <button class="rail__item" data-tab="diagnostics">Diagnostics</button>
       <button class="rail__item" data-tab="share">Share over LAN</button>
       <button class="rail__item" data-tab="about">About</button>
