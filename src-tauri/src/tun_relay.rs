@@ -423,9 +423,18 @@ fn poll_loop(
             24,
         ));
     });
+    // The default-route gateway MUST be our own address, not a phantom
+    // 172.19.0.1: smoltcp's AnyIP ingress filter drops any non-local packet
+    // whose route resolves to a gateway that is not one of our own addresses
+    // ("no matching routes" — iface/interface/ipv4.rs). With Medium::Ip there
+    // is no link-layer gateway at all; the packet goes straight into the
+    // adapter we are draining, so "we are the gateway" is the correct
+    // semantics — and the only configuration the filter accepts. This one
+    // line silently blackholed every TCP handshake (log 7-1/7-2/7-3: zero
+    // "TCP through tunnel" while UDP sessions lived).
     let _ = iface
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(172, 19, 0, 1));
+        .add_default_ipv4_route(crate::tun::TUN_IPV4);
 
     let mut sockets = SocketSet::new(vec![]);
     let mut tcp_sessions: Vec<TcpEntry> = Vec::new();
@@ -523,6 +532,15 @@ fn sniff_and_seed(
                 return;
             }
             let handle = sockets.add(sock);
+            // Evidence chain, level 1 of 2: the SYN reached the stack and a
+            // listener now owns the flow. (Level 2 is "TCP through tunnel"
+            // once the smoltcp handshake completes and the bridge spawns —
+            // if this line appears without that one, the handshake itself
+            // is failing inside smoltcp.)
+            DiagnosticsLog::i(
+                TAG,
+                &format!("TCP SYN seen → accepting connection to {dst}"),
+            );
             tcp_sessions.push(TcpEntry {
                 handle,
                 dst,
@@ -575,6 +593,10 @@ fn sniff_and_seed(
                 },
             );
             spawn_udp_relay(src_port, to_relay_rx, from_relay_tx);
+            DiagnosticsLog::i(
+                TAG,
+                &format!("UDP session opened on source port {src_port}"),
+            );
         }
         _ => {}
     }
