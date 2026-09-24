@@ -717,42 +717,73 @@ fn spawn_tcp_bridge(
     to_socks: Receiver<Vec<u8>>,
     from_socks: Sender<Vec<u8>>,
 ) {
-    // Reader: SOCKS5 → application.
+    // ONE SOCKS5 CONNECT per flow. A TCP relay is a single bidirectional
+    // connection; the previous code dialled twice (a reader thread and a
+    // writer thread, each with its own CONNECT) and silently split every
+    // browser flow into two unidirectional tunnels: the server's answers
+    // arrived on the writer's connection, which nobody read, while the
+    // reader's connection sat ClientHello-less until the exit killed it.
+    // Symptom (log 8-1/8-2): 120+ "bridged via SOCKS5" handshakes, zero
+    // pages loaded, psiphon "Relay failed … forcibly closed" churn.
     std::thread::Builder::new()
-        .name("tun-tcp-r".into())
+        .name("tun-tcp-io".into())
         .spawn(move || {
-            let result = (|| -> std::io::Result<()> {
-                let mut stream = socks5_connect(socks_port, dst)?;
-                let mut buf = [0u8; 16384];
-                loop {
-                    let n = stream.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    if from_socks.send(buf[..n].to_vec()).is_err() {
-                        break; // app side went away
-                    }
+            let mut stream = match socks5_connect(socks_port, dst) {
+                Ok(s) => s,
+                Err(e) => {
+                    // Evidence chain, level 3: the local smoltcp handshake
+                    // succeeded but the engine-side CONNECT did not. Without
+                    // this line a failed CONNECT was indistinguishable from a
+                    // successful bridge ("bridged via SOCKS5" fired at spawn).
+                    DiagnosticsLog::w(
+                        TAG,
+                        &format!("TCP bridge to {dst} failed: SOCKS5 CONNECT error: {e}"),
+                    );
+                    return;
                 }
-                Ok(())
-            })();
-            let _ = result;
-            // Dropping `from_socks` tells the poll loop this half is over.
-        })
-        .ok();
-    // Writer: application → SOCKS5.
-    std::thread::Builder::new()
-        .name("tun-tcp-w".into())
-        .spawn(move || {
-            let result = (|| -> std::io::Result<()> {
-                let mut stream = socks5_connect(socks_port, dst)?;
-                for chunk in to_socks {
-                    if stream.write_all(&chunk).is_err() {
-                        break;
-                    }
+            };
+            let write_half = match stream.try_clone() {
+                Ok(h) => h,
+                Err(e) => {
+                    DiagnosticsLog::w(
+                        TAG,
+                        &format!("TCP bridge to {dst}: socket clone failed: {e}"),
+                    );
+                    return;
                 }
-                Ok(())
-            })();
-            let _ = result;
+            };
+            // Reader half of the SAME connection: tunnel → application.
+            let reader = std::thread::Builder::new()
+                .name("tun-tcp-r".into())
+                .spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 16384];
+                    loop {
+                        match stream.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if from_socks.send(buf[..n].to_vec()).is_err() {
+                                    break; // app side went away
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // Dropping `from_socks` tells the poll loop this half is
+                    // over (EOF → FIN towards the application).
+                });
+            // Writer half of the SAME connection: application → tunnel.
+            for chunk in to_socks {
+                if write_half.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+            // Application half-closed: dropping the write half sends a FIN
+            // toward the destination while the reader keeps draining.
+            drop(write_half);
+            if let Ok(handle) = reader {
+                let _ = handle.join();
+            }
         })
         .ok();
 }
