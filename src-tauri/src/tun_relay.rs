@@ -178,6 +178,36 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
         ),
     );
 
+    // >>> AETHER-APP-FIX route-verify
+    // Log 12-3 (and 11-2 before it): a fully healthy tunnel — masque-in-masque
+    // ready, watchdog passing, NRPT installed — yet ZERO packets reached the
+    // relay for the whole session. One candidate shape is the catch-all
+    // routes silently not in effect (route add racing adapter readiness, or
+    // a teardown race with the previous connection). Verify they actually
+    // exist and point at the TUN address; retry once, then say it loudly.
+    if !verify_catchall_routes(&tun_gw) {
+        DiagnosticsLog::w(
+            TAG,
+            "Catch-all routes missing right after install — retrying once.",
+        );
+        let _ = route_add_idempotent("0.0.0.0", "128.0.0.0", &tun_gw);
+        let _ = route_add_idempotent("128.0.0.0", "128.0.0.0", &tun_gw);
+        if verify_catchall_routes(&tun_gw) {
+            DiagnosticsLog::i(TAG, "Catch-all routes verified after retry.");
+        } else {
+            DiagnosticsLog::w(
+                TAG,
+                "Catch-all routes STILL missing — traffic will bypass the tunnel entirely; send `route print 0.0.0.0` output.",
+            );
+        }
+    } else {
+        DiagnosticsLog::i(
+            TAG,
+            "Catch-all routes verified: 0.0.0.0/1 + 128.0.0.0/1 point at the TUN adapter.",
+        );
+    }
+    // <<< AETHER-APP-FIX
+
     // DNS must ride the tunnel — name resolution is where the GFW bites
     // first. Windows resolves via ALL adapters' DNS servers in parallel and
     // uses the first answer ("Smart Multi-Homed Name Resolution"), so the
@@ -223,11 +253,21 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
         std::thread::Builder::new()
             .name("tun-read".into())
             .spawn(move || {
+                // >>> AETHER-APP-FIX zero-traffic-alarm
+                // The read thread's health was invisible: if it ever died
+                // early the relay looked "live" while the adapter delivered
+                // nothing (the zero-traffic shape of logs 11-2/12-3). Count
+                // what it hands over and report on exit.
+                let mut seen: u64 = 0;
+                // <<< AETHER-APP-FIX
                 while !stop.load(Ordering::Relaxed) {
                     match session.try_receive() {
                         Ok(Some(packet)) => {
                             let bytes = packet.bytes().to_vec();
                             drop(packet);
+                            // >>> AETHER-APP-FIX zero-traffic-alarm
+                            seen += 1;
+                            // <<< AETHER-APP-FIX
                             // A full queue means the poll loop is stuck; drop
                             // newest rather than wedging the ring buffer.
                             let _ = pkt_tx.send(bytes);
@@ -242,6 +282,15 @@ pub fn engage(session: Arc<wintun::Session>, mtu: u16, socks_port: u16) -> Resul
                         Err(_) => break, // session closed by teardown
                     }
                 }
+                // >>> AETHER-APP-FIX zero-traffic-alarm
+                DiagnosticsLog::i(
+                    TAG,
+                    &format!(
+                        "tun-read thread ended: {seen} packet(s) handed over, stop={}.",
+                        stop.load(Ordering::Relaxed)
+                    ),
+                );
+                // <<< AETHER-APP-FIX
             })
             .ok();
     }
@@ -329,6 +378,22 @@ fn default_gateway() -> Result<Ipv4Addr> {
     }
     Err(anyhow!("no active 0.0.0.0/0 row in route print"))
 }
+
+// ---------------------------------------------------------------------------
+// >>> AETHER-APP-FIX route-verify
+// ---------------------------------------------------------------------------
+
+/// True iff both halves of the catch-all route exist AND point at the TUN
+/// address. Get-NetRoute prints the NextHop of every matching route; we need
+/// at least two rows equal to the TUN address.
+fn verify_catchall_routes(tun_gw: &str) -> bool {
+    let script = "Get-NetRoute -DestinationPrefix '0.0.0.0/1','128.0.0.0/1' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty NextHop";
+    match run_powershell(script) {
+        Ok(out) => out.lines().filter(|l| l.trim() == tun_gw).count() >= 2,
+        Err(_) => false,
+    }
+}
+// <<< AETHER-APP-FIX
 
 // ---------------------------------------------------------------------------
 // DNS policy (NRPT) and resolver hygiene
@@ -566,6 +631,14 @@ fn poll_loop(
     let mut tcp_sessions: Vec<TcpEntry> = Vec::new();
     let mut udp_sessions: HashMap<u16, UdpEntry> = HashMap::new();
     let start = Instant::now();
+    // >>> AETHER-APP-FIX zero-traffic-alarm
+    // Logs 11-2/12-3: the tunnel was fully healthy yet no packet EVER reached
+    // the adapter, so "pages won't open" was indistinguishable from "the user
+    // didn't browse". Count inbound packets and say it loudly when a connected
+    // session stays at zero — with the exact evidence to capture next time.
+    let mut adapter_pkts: u64 = 0;
+    let mut last_zero_alarm: Option<Instant> = None;
+    // <<< AETHER-APP-FIX
     while !stop.load(Ordering::Relaxed) {
         // 1. Drain the Wintun read thread into the device queue.
         {
@@ -599,6 +672,25 @@ fn poll_loop(
             // the UDP/TCP partition below can consume it.
             std::mem::take(&mut *q).into()
         };
+        // >>> AETHER-APP-FIX zero-traffic-alarm
+        adapter_pkts += incoming.len() as u64;
+        if adapter_pkts == 0 && start.elapsed() > Duration::from_secs(60) {
+            let fire = match last_zero_alarm {
+                None => true,
+                Some(t) => t.elapsed() > Duration::from_secs(120),
+            };
+            if fire {
+                last_zero_alarm = Some(Instant::now());
+                DiagnosticsLog::w(
+                    TAG,
+                    &format!(
+                        "TUN relay: 0 packets received from the adapter in {:.0}s while connected — nothing can traverse the tunnel. If you tried to browse: run `route print 0.0.0.0` and `Get-DnsClientNrptRule` in PowerShell and send the output; also check the browser's proxy settings (a stale 127.0.0.1 proxy would bypass the TUN entirely).",
+                        start.elapsed().as_secs_f32()
+                    ),
+                );
+            }
+        }
+        // <<< AETHER-APP-FIX
         for pkt in &incoming {
             sniff_and_seed(pkt, &mut sockets, &mut tcp_sessions);
         }
@@ -1577,10 +1669,53 @@ fn socks_request(
     Ok(SocketAddr::new(addr, u16::from_be_bytes(p)))
 }
 
+/// >>> AETHER-APP-FIX socks-refused-retry
+/// Connect to the engine's SOCKS5 listener, retrying while it refuses the
+/// dial. Log 12-2: while the engine re-establishes its inner tunnel (warp×2,
+/// ~12 s in the log), the listener on 1819 goes away and every bridge and
+/// DNS query in that window died with os error 10061 ("connection refused")
+/// — the browser's own retries are what the user feels as "pages take a
+/// while to open". Each flow already runs in a dedicated thread with the
+/// client's socket buffered in smoltcp, so holding the dial through the gap
+/// costs nothing and converts the blackhole into a wait.
+const SOCKS_REFUSED_RETRY_WINDOW: Duration = Duration::from_secs(20);
+const SOCKS_REFUSED_RETRY_STEP: Duration = Duration::from_millis(500);
+
+fn tcp_connect_socks(socks_port: u16) -> std::io::Result<TcpStream> {
+    let begin = Instant::now();
+    loop {
+        match TcpStream::connect(("127.0.0.1", socks_port)) {
+            Ok(s) => {
+                let waited = begin.elapsed();
+                if waited > Duration::from_millis(100) {
+                    DiagnosticsLog::w(
+                        TAG,
+                        &format!(
+                            "SOCKS5 port {socks_port} refused for {:.1}s, then accepted — the engine was re-establishing its tunnels; the flow was held instead of dropped.",
+                            waited.as_secs_f32()
+                        ),
+                    );
+                }
+                return Ok(s);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                if begin.elapsed() >= SOCKS_REFUSED_RETRY_WINDOW {
+                    return Err(e);
+                }
+                std::thread::sleep(SOCKS_REFUSED_RETRY_STEP);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+// <<< AETHER-APP-FIX
+
 /// SOCKS5 CONNECT to `dst` through the engine exit; the returned stream is
 /// the tunnel.
 fn socks5_connect(socks_port: u16, dst: IpEndpoint) -> std::io::Result<TcpStream> {
-    let mut stream = TcpStream::connect(("127.0.0.1", socks_port))?;
+    // >>> AETHER-APP-FIX socks-refused-retry
+    let mut stream = tcp_connect_socks(socks_port)?;
+    // <<< AETHER-APP-FIX
     stream.set_nodelay(true).ok();
     // Greeting and CONNECT must not hang forever: a SOCKS5 that accepts the
     // TCP dial but never answers the handshake used to stall the whole
@@ -1601,7 +1736,9 @@ fn socks5_connect(socks_port: u16, dst: IpEndpoint) -> std::io::Result<TcpStream
 /// SOCKS5 UDP ASSOCIATE; returns the control connection and the relay
 /// endpoint to send datagrams to.
 fn socks5_udp_associate(socks_port: u16, _src_port: u16) -> std::io::Result<(TcpStream, SocketAddr)> {
-    let mut stream = TcpStream::connect(("127.0.0.1", socks_port))?;
+    // >>> AETHER-APP-FIX socks-refused-retry
+    let mut stream = tcp_connect_socks(socks_port)?;
+    // <<< AETHER-APP-FIX
     stream.set_nodelay(true).ok();
     socks_greet(&mut stream)?;
     // BND.ADDR of 0.0.0.0:0 = "server, you choose"; the reply carries the
