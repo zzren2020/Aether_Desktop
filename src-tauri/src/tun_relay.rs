@@ -744,7 +744,15 @@ fn parse_udp_datagram(pkt: &[u8]) -> Option<(IpEndpoint, IpEndpoint, &[u8])> {
     // NBNS (137), mDNS (5353), SSDP and friends are broadcast/multicast by
     // nature — they must never leave the machine (log 6-3).
     let dst_addr = ipv4.dst_addr();
-    if dst_addr.is_broadcast() || dst_addr.is_multicast() || dst_addr.is_unspecified() {
+    if dst_addr.is_broadcast()
+        || dst_addr.is_multicast()
+        || dst_addr.is_unspecified()
+        // >>> AETHER-APP-FIX directed-broadcast-filter
+        // Subnet-directed broadcast (172.19.0.255 — seen as a NetBIOS session
+        // in log 11-2): the last octet 255 is never a real unicast host.
+        || dst_addr.octets()[3] == 255
+    // <<< AETHER-APP-FIX
+    {
         return None;
     }
     if sport == 0 || dport == 0 {
@@ -1264,17 +1272,74 @@ fn establish_udp_associate(src_port: u16) -> std::io::Result<(TcpStream, StdUdpS
 /// Resolve one DNS query over DNS-over-TCP (RFC 1035 §4.2.2: 2-byte length
 /// prefix) through a SOCKS5 CONNECT to the resolver — the transport every
 /// exit pipeline supports, unlike UDP ASSOCIATE.
+///
+/// >>> AETHER-APP-FIX dns-cache-retry
+/// Log 11-3 showed 8 distinct names failing within the same 5 ms window — a
+/// query storm outrunning the one-CONNECT-per-query resolver path — and log
+/// 11-1's single i.ytimg.com failure came seconds after the same name had
+/// resolved fine. Two defenses: a small TTL cache collapses repeats (a page
+/// load asks for the same name over and over), and one retry absorbs
+/// transient CONNECT/read timeouts under load.
+const DNS_CACHE_TTL: Duration = Duration::from_secs(120);
+
+fn dns_cache() -> &'static Mutex<HashMap<Vec<u8>, (Vec<u8>, Instant)>> {
+    static CACHE: std::sync::OnceLock<Mutex<HashMap<Vec<u8>, (Vec<u8>, Instant)>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Cache key = the question section (offset 12..): identical for every
+/// retransmit of the same name/type, unlike the per-query transaction ID in
+/// bytes 0-1 which changes every time.
+fn dns_cache_get(query: &[u8]) -> Option<Vec<u8>> {
+    let cache = dns_cache().lock().ok()?;
+    let (resp, at) = cache.get(&query[12..].to_vec())?;
+    if at.elapsed() > DNS_CACHE_TTL {
+        return None;
+    }
+    // Rewrite the transaction ID so the reply matches THIS query — the OS
+    // resolver silently drops responses whose ID differs from the outstanding
+    // one, and a cached reply carries the ID of the query that filled it.
+    let mut hit = resp.clone();
+    hit[0] = query[0];
+    hit[1] = query[1];
+    Some(hit)
+}
+
+fn dns_cache_put(query: &[u8], resp: &[u8]) {
+    let mut cache = dns_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 1024 {
+        cache.clear();
+    }
+    cache.insert(query[12..].to_vec(), (resp.to_vec(), Instant::now()));
+}
+// <<< AETHER-APP-FIX
+
 fn dns_over_tcp(query: &[u8], dst: &IpEndpoint) -> Option<Vec<u8>> {
     if query.len() < 12 || query.len() > 4096 {
         return None;
     }
     let name = dns_qname(query);
-    let result = dns_over_tcp_inner(query, dst);
+    // >>> AETHER-APP-FIX dns-cache-retry
+    if let Some(hit) = dns_cache_get(query) {
+        DiagnosticsLog::i(
+            TAG,
+            &format!("DNS cache hit: {name} ({} B)", hit.len()),
+        );
+        return Some(hit);
+    }
+    // One retry: the failures in logs 11-1/11-3 are transient timeouts under
+    // a query storm, not resolver policy — a second CONNECT succeeds.
+    let result = dns_over_tcp_inner(query, dst).or_else(|| dns_over_tcp_inner(query, dst));
+    // <<< AETHER-APP-FIX
     match &result {
         Some(resp) => {
             // ANCOUNT lives at bytes 6-8 of the message; strip_aaaa may have
             // rewritten the section, so report the ORIGINAL answer count.
             let ancount = u16::from_be_bytes([resp[6], resp[7]]);
+            // >>> AETHER-APP-FIX dns-cache-retry
+            dns_cache_put(query, resp);
+            // <<< AETHER-APP-FIX
             DiagnosticsLog::i(
                 TAG,
                 &format!(
@@ -1323,8 +1388,11 @@ fn dns_qname(query: &[u8]) -> String {
 
 fn dns_over_tcp_inner(query: &[u8], dst: &IpEndpoint) -> Option<Vec<u8>> {
     let mut stream = socks5_connect(socks_port_of(), *dst).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(4))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(4))).ok();
+    // >>> AETHER-APP-FIX dns-cache-retry: 4s → 6s — log 11-3's failure burst
+    // hit queries racing ~10 concurrent CONNECTs; a wider window rides out
+    // the storm (the caller retries once on top of this).
+    stream.set_read_timeout(Some(Duration::from_secs(6))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(6))).ok();
     let mut msg = Vec::with_capacity(query.len() + 2);
     msg.extend_from_slice(&(query.len() as u16).to_be_bytes());
     msg.extend_from_slice(query);
